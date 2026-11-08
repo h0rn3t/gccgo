@@ -1737,6 +1737,15 @@ Escape_analysis_assign::expression(Expression** pexpr)
                 // these do not escape.
                 break;
 
+              case Runtime::TYPEDMEMMOVE:
+                {
+                  // *dst = *src.  Pointers in the source are copied out
+                  // and must be treated as escaping.
+                  Node* src_node = Node::make_node(call->args()->at(2));
+                  this->assign_deref(this->context_->sink(), src_node);
+                }
+                break;
+
               case Runtime::IFACEE2E2:
               case Runtime::IFACEI2E2:
               case Runtime::IFACEE2I2:

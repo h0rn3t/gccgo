@@ -4167,7 +4167,7 @@ Type_conversion_expression::do_type()
 }
 
 // Convert to a constant at lowering time.  Also lower conversions
-// from slice to pointer-to-array, as they can panic.
+// from slice to array or pointer-to-array, as they can panic.
 
 Expression*
 Type_conversion_expression::do_lower(Gogo* gogo, Named_object*,
@@ -4309,6 +4309,78 @@ Type_conversion_expression::do_lower(Gogo* gogo, Named_object*,
       ptr = Expression::make_unsafe_cast(type, ptr, location);
 
       Expression* ret = Expression::make_compound(check, ptr, location);
+      ret->determine_type_no_context(gogo);
+      return ret;
+    }
+
+  // []T to [N]T copies N elements.  A short slice panics, as for the
+  // pointer conversion above.
+  if (type->array_type() != NULL
+      && !type->is_slice_type()
+      && val->type()->is_slice_type()
+      && Type::are_identical(type->array_type()->element_type(),
+			     val->type()->array_type()->element_type(),
+			     0, NULL))
+    {
+      Temporary_statement* val_temp = NULL;
+      if (!val->is_multi_eval_safe())
+	{
+	  val_temp = Statement::make_temporary(val->type(), NULL, location);
+	  inserter->insert(val_temp);
+	  val = Expression::make_set_and_use_temporary(val_temp, val,
+						       location);
+	}
+
+      Type* int_type = Type::lookup_integer_type("int");
+      Temporary_statement* vallen_temp =
+	Statement::make_temporary(int_type, NULL, location);
+      inserter->insert(vallen_temp);
+
+      Expression* arrlen = type->array_type()->length()->copy();
+      Expression* vallen =
+	Expression::make_slice_info(val, Expression::SLICE_INFO_LENGTH,
+				    location);
+      vallen = Expression::make_set_and_use_temporary(vallen_temp, vallen,
+						      location);
+      Expression* cond = Expression::make_binary(OPERATOR_GT, arrlen, vallen,
+						 location);
+
+      vallen = Expression::make_temporary_reference(vallen_temp, location);
+      Expression* panic = Runtime::make_call(gogo,
+					     Runtime::PANIC_SLICE_CONVERT,
+					     location, 2, arrlen->copy(), vallen);
+
+      Expression* nil = Expression::make_nil(location);
+      Expression* check = Expression::make_conditional(cond, panic, nil,
+						       location);
+
+      Temporary_statement* arr_temp =
+	Statement::make_temporary(type, NULL, location);
+      inserter->insert(arr_temp);
+
+      Expression* dst =
+	Expression::make_temporary_reference(arr_temp, location);
+      dst = Expression::make_unary(OPERATOR_AND, dst, location);
+      dst->unary_expression()->set_does_not_escape();
+
+      if (val_temp == NULL)
+	val = val->copy();
+      else
+	val = Expression::make_temporary_reference(val_temp, location);
+      Expression* src =
+	Expression::make_slice_info(val, Expression::SLICE_INFO_VALUE_POINTER,
+				    location);
+      Type* unsafe_ptr = Type::make_pointer_type(Type::make_void_type());
+      src = Expression::make_unsafe_cast(unsafe_ptr, src, location);
+      dst = Expression::make_unsafe_cast(unsafe_ptr, dst, location);
+
+      Expression* td = Expression::make_type_descriptor(type, location);
+      Expression* move = Runtime::make_call(gogo, Runtime::TYPEDMEMMOVE,
+					    location, 3, td, dst, src);
+      Expression* arr =
+	Expression::make_temporary_reference(arr_temp, location);
+      Expression* copied = Expression::make_compound(move, arr, location);
+      Expression* ret = Expression::make_compound(check, copied, location);
       ret->determine_type_no_context(gogo);
       return ret;
     }

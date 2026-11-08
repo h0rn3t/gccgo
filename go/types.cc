@@ -856,7 +856,15 @@ Type::are_convertible(const Type* lhs, const Type* rhs, std::string* reason)
 	return true;
     }
 
-  // A slice may be converted to a pointer-to-array.
+  // A slice may be converted to an array or to a pointer-to-array.
+  // The array length is checked at run time.
+  if (rhs->is_slice_type()
+      && lhs->array_type() != NULL
+      && !lhs->is_slice_type()
+      && Type::are_identical(lhs->array_type()->element_type(),
+			     rhs->array_type()->element_type(), 0, reason))
+    return true;
+
   if (rhs->is_slice_type()
       && lhs->points_to() != NULL
       && lhs->points_to()->array_type() != NULL

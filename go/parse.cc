@@ -46,6 +46,8 @@ Parse::Parse(Lex* lex, Gogo* gogo)
     token_(Token::make_invalid_token(Linemap::unknown_location())),
     unget_token_(Token::make_invalid_token(Linemap::unknown_location())),
     unget_token_valid_(false),
+    replay_(),
+    replay_token_(Token::make_invalid_token(Linemap::unknown_location())),
     is_erroneous_function_(false),
     gogo_(gogo),
     break_stack_(NULL),
@@ -59,6 +61,11 @@ Parse::Parse(Lex* lex, Gogo* gogo)
 const Token*
 Parse::peek_token()
 {
+  if (!this->replay_.empty())
+    {
+      this->replay_token_ = this->replay_.front();
+      return &this->replay_token_;
+    }
   if (this->unget_token_valid_)
     return &this->unget_token_;
   if (this->token_.is_invalid())
@@ -71,6 +78,17 @@ Parse::peek_token()
 const Token*
 Parse::advance_token()
 {
+  if (!this->replay_.empty())
+    {
+      this->replay_.erase(this->replay_.begin());
+      if (!this->replay_.empty())
+	{
+	  this->replay_token_ = this->replay_.front();
+	  return &this->replay_token_;
+	}
+      if (!this->token_.is_invalid())
+	return &this->token_;
+    }
   if (this->unget_token_valid_)
     {
       this->unget_token_valid_ = false;
@@ -86,6 +104,7 @@ Parse::advance_token()
 void
 Parse::unget_token(const Token& token)
 {
+  go_assert(this->replay_.empty());
   go_assert(!this->unget_token_valid_);
   this->unget_token_ = token;
   this->unget_token_valid_ = true;
@@ -253,6 +272,18 @@ Parse::type()
     {
       Location location = token->location();
       this->advance_token();
+      if (this->peek_token()->is_op(OPERATOR_LSQUARE))
+	{
+	  go_error_at(this->location(),
+		      "function type must have no type parameters");
+	  Bindings tpscope(NULL);
+	  Bindings* hold = this->gogo_->type_parameter_bindings();
+	  this->gogo_->set_type_parameter_bindings(&tpscope);
+	  this->type_parameter_list();
+	  this->signature(NULL, location);
+	  this->gogo_->set_type_parameter_bindings(hold);
+	  return Type::make_error_type();
+	}
       Type* type = this->signature(NULL, location);
       if (type == NULL)
 	return Type::make_error_type();
@@ -1264,7 +1295,18 @@ Parse::method_spec(Typed_identifier_list* methods)
   bool is_exported = token->is_identifier_exported();
   Location location = token->location();
 
-  if (this->advance_token()->is_op(OPERATOR_LPAREN))
+  if (this->advance_token()->is_op(OPERATOR_LSQUARE))
+    {
+      // Instantiated embedded types are parsed later.  A type
+      // parameter list on an interface method is invalid.
+      go_error_at(location, "interface method must have no type parameters");
+      while (!this->peek_token()->is_eof()
+	     && !this->peek_token()->is_op(OPERATOR_SEMICOLON)
+	     && !this->peek_token()->is_op(OPERATOR_RCURLY))
+	this->advance_token();
+      return;
+    }
+  else if (this->peek_token()->is_op(OPERATOR_LPAREN))
     {
       // This is a MethodName.
       if (name == "_")
@@ -1606,6 +1648,298 @@ Parse::update_references(Expression** pexpr)
   (*pexpr)->traverse_subexpressions(&ur);
 }
 
+// A token that can only be a type element, not an array-length expression.
+// A bare identifier is not one: it is also a name or a value.
+
+static bool
+token_starts_type_element(const Token* token)
+{
+  return (token->is_op(OPERATOR_LSQUARE)
+	  || token->is_op(OPERATOR_MULT)
+	  || token->is_op(OPERATOR_LPAREN)
+	  || token->is_op(OPERATOR_TILDE)
+	  || token->is_op(OPERATOR_CHANOP)
+	  || token->is_keyword(KEYWORD_STRUCT)
+	  || token->is_keyword(KEYWORD_INTERFACE)
+	  || token->is_keyword(KEYWORD_FUNC)
+	  || token->is_keyword(KEYWORD_MAP)
+	  || token->is_keyword(KEYWORD_CHAN));
+}
+
+// type Name [ ... ] is either an array or a type parameter list.
+// The current token is '['.  This reads ahead and puts every token
+// back, including '['.
+
+bool
+Parse::bracket_introduces_type_parameters()
+{
+  go_assert(this->peek_token()->is_op(OPERATOR_LSQUARE));
+  go_assert(this->replay_.empty());
+
+  std::vector<Token> got;
+  got.push_back(*this->peek_token());
+
+  const Token* token = this->advance_token();
+  got.push_back(*token);
+
+  bool yes = false;
+  if (token->is_identifier())
+    {
+      token = this->advance_token();
+      got.push_back(*token);
+      if (token->is_op(OPERATOR_RSQUARE))
+	yes = false;
+      else if (token->is_op(OPERATOR_LPAREN))
+	{
+	  // type F[N(2)]int is an array length.  type F[T([]int)] and
+	  // type F[T(int),] are constraints: a parenthesized type is a
+	  // type element only when its body cannot be a value, or when
+	  // a comma forces the type-parameter reading.
+	  bool inner_type_elem = false;
+	  int depth = 1;
+	  while (depth > 0 && !this->peek_token()->is_eof())
+	    {
+	      token = this->advance_token();
+	      got.push_back(*token);
+	      if (token->is_op(OPERATOR_LPAREN))
+		++depth;
+	      else if (token->is_op(OPERATOR_RPAREN))
+		--depth;
+	      else if (depth > 0
+		       && (token->is_op(OPERATOR_LSQUARE)
+			   || token->is_op(OPERATOR_TILDE)
+			   || token->is_keyword(KEYWORD_STRUCT)
+			   || token->is_keyword(KEYWORD_INTERFACE)
+			   || token->is_keyword(KEYWORD_FUNC)
+			   || token->is_keyword(KEYWORD_MAP)
+			   || token->is_keyword(KEYWORD_CHAN)
+			   || token->is_op(OPERATOR_CHANOP)))
+		inner_type_elem = true;
+	    }
+	  if (inner_type_elem)
+	    yes = true;
+	  else if (!this->peek_token()->is_eof())
+	    {
+	      token = this->advance_token();
+	      got.push_back(*token);
+	      yes = token->is_op(OPERATOR_COMMA);
+	    }
+	}
+      else if (token->is_op(OPERATOR_COMMA)
+	       || token->is_identifier()
+	       || token_starts_type_element(token))
+	yes = true;
+      else if (token->is_op(OPERATOR_MULT))
+	{
+	  token = this->advance_token();
+	  got.push_back(*token);
+	  if (token_starts_type_element(token))
+	    yes = true;
+	  else if (token->is_identifier())
+	    {
+	      // type F[T *int] is an array length.  type F[T *U,] is
+	      // a constraint.  type F[T *U|V] is a union constraint.
+	      token = this->advance_token();
+	      got.push_back(*token);
+	      yes = (token->is_op(OPERATOR_COMMA)
+		     || token->is_op(OPERATOR_OR));
+	    }
+	}
+    }
+
+  go_assert(!got.empty());
+  for (size_t i = 0; i + 1 < got.size(); ++i)
+    this->replay_.push_back(got[i]);
+  return yes;
+}
+
+// Type constraint.  '~' and '|' are recognized and skipped so the
+// parser stays aligned.  They are not constraints yet.
+
+Type*
+Parse::type_constraint()
+{
+  if (this->peek_token()->is_op(OPERATOR_TILDE))
+    {
+      go_error_at(this->location(),
+		  "approximate type constraints are not supported yet");
+      this->advance_token();
+    }
+
+  Type* constraint = this->type();
+  bool reported_union = false;
+  while (this->peek_token()->is_op(OPERATOR_OR))
+    {
+      if (!reported_union)
+	{
+	  go_error_at(this->location(),
+		      "union constraints are not supported yet");
+	  reported_union = true;
+	}
+      this->advance_token();
+      if (this->peek_token()->is_op(OPERATOR_TILDE))
+	this->advance_token();
+      if (this->peek_token()->is_op(OPERATOR_OR)
+	  || this->peek_token()->is_op(OPERATOR_COMMA)
+	  || this->peek_token()->is_op(OPERATOR_RSQUARE)
+	  || this->peek_token()->is_eof())
+	{
+	  go_error_at(this->location(), "expected type");
+	  break;
+	}
+      this->type();
+    }
+  return constraint;
+}
+
+// One name in a type parameter list, before it is bound.
+struct Parse_type_parameter_name
+{
+  std::string name;
+  bool is_exported;
+  Location location;
+};
+
+// TypeParameters = "[" TypeParamDecl { "," TypeParamDecl } [","] "]" .
+// TypeParamDecl  = IdentifierList TypeConstraint .
+
+// Names are bound in the bindings already installed on Gogo, before
+// the constraint is parsed, so a later parameter can use an earlier
+// one.  The blank identifier is allowed and is not bound.
+
+Typed_identifier_list*
+Parse::type_parameter_list()
+{
+  go_assert(this->peek_token()->is_op(OPERATOR_LSQUARE));
+  Bindings* bindings = this->gogo_->type_parameter_bindings();
+  go_assert(bindings != NULL);
+
+  Location open_loc = this->location();
+  this->advance_token();
+
+  if (this->peek_token()->is_op(OPERATOR_RSQUARE))
+    {
+      go_error_at(open_loc, "empty type parameter list");
+      this->advance_token();
+      return NULL;
+    }
+
+  Typed_identifier_list* ret = new Typed_identifier_list();
+
+  while (!this->peek_token()->is_op(OPERATOR_RSQUARE)
+	 && !this->peek_token()->is_eof())
+    {
+      if (this->peek_token()->is_op(OPERATOR_COMMA))
+	{
+	  this->advance_token();
+	  continue;
+	}
+
+      if (!this->peek_token()->is_identifier())
+	{
+	  go_error_at(this->location(), "expected type parameter name");
+	  break;
+	}
+
+      std::vector<Parse_type_parameter_name> names;
+      while (this->peek_token()->is_identifier())
+	{
+	  const Token* id = this->peek_token();
+	  Parse_type_parameter_name nm;
+	  nm.name = id->identifier();
+	  nm.is_exported = id->is_identifier_exported();
+	  nm.location = id->location();
+	  names.push_back(nm);
+	  this->advance_token();
+
+	  if (!this->peek_token()->is_op(OPERATOR_COMMA))
+	    break;
+
+	  Location comma_loc = this->location();
+	  this->advance_token();
+	  if (this->peek_token()->is_identifier())
+	    continue;
+
+	  go_error_at(comma_loc, "expected type parameter name");
+	  break;
+	}
+
+      if (this->peek_token()->is_op(OPERATOR_ELLIPSIS))
+	{
+	  go_error_at(this->location(),
+		      "type parameter list must have no %<...%>");
+	  this->advance_token();
+	}
+
+      // Bind the names before parsing the constraint.  A constraint
+      // may name a type parameter from this list.
+      std::vector<Type_parameter*> params;
+      for (size_t i = 0; i < names.size(); ++i)
+	{
+	  if (Gogo::is_sink_name(names[i].name))
+	    {
+	      Type* raw = Type::make_type_parameter("_", NULL,
+						    names[i].location);
+	      params.push_back(raw->type_parameter());
+	      ret->push_back(Typed_identifier("_", raw, names[i].location));
+	      continue;
+	    }
+
+	  std::string packed = this->gogo_->pack_hidden_name(names[i].name,
+							    names[i].is_exported);
+	  if (bindings->lookup_local(packed) != NULL)
+	    {
+	      go_error_at(names[i].location, "redefinition of %qs",
+			  names[i].name.c_str());
+	      params.push_back(NULL);
+	      continue;
+	    }
+
+	  Type* raw = Type::make_type_parameter(packed, NULL,
+						names[i].location);
+	  Named_object* no = Named_object::make_type(packed, NULL, raw,
+						     names[i].location);
+	  bindings->add_named_object(no);
+	  params.push_back(raw->type_parameter());
+	  ret->push_back(Typed_identifier(packed, no->type_value(),
+					  names[i].location));
+	}
+
+      Type* constraint;
+      if (this->peek_token()->is_op(OPERATOR_RSQUARE)
+	  || this->peek_token()->is_op(OPERATOR_COMMA)
+	  || this->peek_token()->is_eof())
+	{
+	  go_error_at(names.back().location,
+		      "type parameter missing constraint");
+	  constraint = Type::make_error_type();
+	}
+      else
+	constraint = this->type_constraint();
+
+      for (size_t i = 0; i < params.size(); ++i)
+	{
+	  if (params[i] != NULL)
+	    params[i]->set_constraint(constraint);
+	}
+
+      if (this->peek_token()->is_op(OPERATOR_COMMA))
+	this->advance_token();
+    }
+
+  if (!this->peek_token()->is_op(OPERATOR_RSQUARE))
+    go_error_at(this->location(), "expected %<]%>");
+  else
+    this->advance_token();
+
+  if (ret->empty())
+    {
+      delete ret;
+      return NULL;
+    }
+  return ret;
+}
+
 // TypeDecl = "type" Decl<TypeSpec> .
 
 void
@@ -1635,13 +1969,6 @@ Parse::type_spec()
   Location location = token->location();
   token = this->advance_token();
 
-  bool is_alias = false;
-  if (token->is_op(OPERATOR_EQ))
-    {
-      is_alias = true;
-      token = this->advance_token();
-    }
-
   // The scope of the type name starts at the point where the
   // identifier appears in the source code.  We implement this by
   // declaring the type before we read the type definition.
@@ -1650,6 +1977,30 @@ Parse::type_spec()
     {
       name = this->gogo_->pack_hidden_name(name, is_exported);
       named_type = this->gogo_->declare_type(name, location);
+    }
+
+  // type F[T any] is a generic type.  type F[N]E and type F[T *int] E
+  // are arrays: a name followed by * and a name is an array length
+  // (see golang/go#49482) unless a later token shows a constraint.
+  Typed_identifier_list* tparams = NULL;
+  Bindings tpscope(NULL);
+  Bindings* hold_tparams = NULL;
+  bool clear_tparams = false;
+  if (token->is_op(OPERATOR_LSQUARE)
+      && this->bracket_introduces_type_parameters())
+    {
+      hold_tparams = this->gogo_->type_parameter_bindings();
+      this->gogo_->set_type_parameter_bindings(&tpscope);
+      clear_tparams = true;
+      tparams = this->type_parameter_list();
+      token = this->peek_token();
+    }
+
+  bool is_alias = false;
+  if (token->is_op(OPERATOR_EQ))
+    {
+      is_alias = true;
+      token = this->advance_token();
     }
 
   Type* type;
@@ -1692,6 +2043,8 @@ Parse::type_spec()
 	  Named_type* nt = Type::make_named_type(named_type, type, location);
 	  if (is_alias)
 	    nt->set_is_alias();
+	  if (tparams != NULL)
+	    nt->set_type_parameters(tparams);
 
 	  this->gogo_->define_type(named_type, nt);
 	  go_assert(named_type->package() == NULL);
@@ -1711,6 +2064,9 @@ Parse::type_spec()
 	  this->gogo_->add_type(name, type, location);
 	}
     }
+
+  if (clear_tparams)
+    this->gogo_->set_type_parameter_bindings(hold_tparams);
 }
 
 // VarDecl = "var" Decl<VarSpec> .
@@ -2464,7 +2820,51 @@ Parse::function_decl()
 
   this->advance_token();
 
+  // func F[T any](...) is always a type parameter list.  A method
+  // may not declare its own type parameters (Go 1.18).  The list is
+  // still parsed so the signature can name T, and the function is
+  // marked generic so it is not emitted.
+  struct Clear_type_parameter_bindings
+  {
+    Gogo* gogo;
+    Bindings* saved;
+    bool active;
+
+    Clear_type_parameter_bindings(Gogo* g)
+      : gogo(g), saved(g->type_parameter_bindings()), active(false)
+    { }
+
+    ~Clear_type_parameter_bindings()
+    {
+      if (this->active)
+	this->gogo->set_type_parameter_bindings(this->saved);
+    }
+  };
+
+  Bindings tpscope(NULL);
+  Clear_type_parameter_bindings clear_tp(this->gogo_);
+  Typed_identifier_list* tparams = NULL;
+  bool method_tparams = false;
+  if (this->peek_token()->is_op(OPERATOR_LSQUARE))
+    {
+      if (rec != NULL)
+	{
+	  go_error_at(this->location(),
+		      "method must have no type parameters");
+	  method_tparams = true;
+	}
+      this->gogo_->set_type_parameter_bindings(&tpscope);
+      clear_tp.active = true;
+      tparams = this->type_parameter_list();
+    }
+
   Function_type* fntype = this->signature(rec, this->location());
+
+  if (clear_tp.active)
+    {
+      this->gogo_->set_type_parameter_bindings(clear_tp.saved);
+      clear_tp.active = false;
+    }
 
   Named_object* named_object = NULL;
 
@@ -2608,6 +3008,9 @@ Parse::function_decl()
 
       if (pragmas != 0 && named_object->is_function_declaration())
 	named_object->func_declaration_value()->set_pragmas(pragmas);
+      if (tparams != NULL && named_object != NULL
+	  && named_object->is_function_declaration())
+	named_object->func_declaration_value()->set_type_parameters(tparams);
     }
   else
     {
@@ -2620,7 +3023,28 @@ Parse::function_decl()
 	    this->gogo_->add_erroneous_name(name);
 	  name = this->gogo_->pack_hidden_name("_", false);
 	}
-      named_object = this->gogo_->start_function(name, fntype, true, location);
+      named_object = this->gogo_->start_function(name, fntype,
+						 !method_tparams, location);
+      if (tparams != NULL && named_object->is_function())
+	{
+	  named_object->func_value()->set_type_parameters(tparams);
+	  // A parameter with the same name shadows the type parameter.
+	  // Keep the name out of the definition list: the block is
+	  // walked when lowering, and a type parameter has no backend
+	  // type.
+	  Bindings* block_bindings = named_object->func_value()->block()
+	    ->bindings();
+	  for (Bindings::const_definitions_iterator p =
+		 tpscope.begin_definitions();
+	       p != tpscope.end_definitions();
+	       ++p)
+	    {
+	      if (block_bindings->lookup_local((*p)->name()) != NULL)
+		continue;
+	      block_bindings->add_named_object(*p);
+	      block_bindings->remove_definition(*p);
+	    }
+	}
       Location end_loc = this->block();
       this->gogo_->finish_function(end_loc);
 

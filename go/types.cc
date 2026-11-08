@@ -458,6 +458,10 @@ Type::are_identical(const Type* t1, const Type* t2, int flags,
 	*reason = "invalid use of multiple-value function call";
       return false;
 
+    case TYPE_TYPE_PARAMETER:
+      // The same type parameter is handled by pointer identity above.
+      return false;
+
     default:
       go_unreachable();
     }
@@ -4082,6 +4086,60 @@ Type::make_error_type()
 {
   static Error_type singleton_error_type;
   return &singleton_error_type;
+}
+
+// Class Type_parameter.
+
+int
+Type_parameter::do_traverse(Traverse* traverse)
+{
+  if (this->constraint_ == NULL)
+    return TRAVERSE_CONTINUE;
+  return Type::traverse(this->constraint_, traverse);
+}
+
+bool
+Type_parameter::do_verify(Gogo* gogo)
+{
+  if (this->constraint_ == NULL)
+    return true;
+  return this->constraint_->verify(gogo);
+}
+
+void
+Type_parameter::report_misuse(const char* msg) const
+{
+  if (this->reported_error_)
+    return;
+  this->reported_error_ = true;
+  go_error_at(this->location_, msg, this->name_.c_str());
+}
+
+Btype*
+Type_parameter::do_get_backend(Gogo* gogo)
+{
+  this->report_misuse("type parameter %qs used without instantiation");
+  return gogo->backend()->error_type();
+}
+
+Expression*
+Type_parameter::do_type_descriptor(Gogo*, Named_type*)
+{
+  this->report_misuse("type parameter %qs used without instantiation");
+  return Expression::make_error(this->location_);
+}
+
+void
+Type_parameter::do_export(Export*) const
+{
+  this->report_misuse("cannot export type parameter %qs");
+}
+
+Type*
+Type::make_type_parameter(const std::string& name, Type* constraint,
+			  Location location)
+{
+  return new Type_parameter(name, constraint, location);
 }
 
 // Class Void_type.
@@ -10580,6 +10638,15 @@ Named_type::do_message_name(std::string* ret) const
   ret->append(this->named_object_->message_name());
 }
 
+int
+Named_type::do_traverse(Traverse* traverse)
+{
+  if (this->type_parameters_ != NULL
+      && this->type_parameters_->traverse(traverse) == TRAVERSE_EXIT)
+    return TRAVERSE_EXIT;
+  return Type::traverse(this->type_, traverse);
+}
+
 // Return the base type for this type.  We have to be careful about
 // circular type definitions, which are invalid but may be seen here.
 
@@ -11539,6 +11606,15 @@ Named_type::do_get_backend(Gogo* gogo)
   if (this->is_error_)
     return gogo->backend()->error_type();
 
+  if (this->type_parameters_ != NULL)
+    {
+      go_error_at(this->location_,
+		  "generic type %qs used without instantiation",
+		  this->named_object_->message_name().c_str());
+      this->is_error_ = true;
+      return gogo->backend()->error_type();
+    }
+
   Btype* bt = this->named_btype_;
 
   if (!gogo->named_types_are_converted())
@@ -11636,6 +11712,13 @@ Named_type::do_get_backend(Gogo* gogo)
       if (!gogo->backend()->set_placeholder_pointer_type(bt, bt1))
 	bt = gogo->backend()->error_type();
       return bt;
+
+    case TYPE_TYPE_PARAMETER:
+      go_error_at(this->location_,
+		  "type parameter %qs used without instantiation",
+		  this->named_object_->message_name().c_str());
+      this->is_error_ = true;
+      return gogo->backend()->error_type();
 
     default:
     case TYPE_SINK:

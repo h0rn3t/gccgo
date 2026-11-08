@@ -427,6 +427,8 @@ op_string(Operator op)
       return "[";
     case OPERATOR_RSQUARE:
       return "]";
+    case OPERATOR_TILDE:
+      return "~";
     default:
       go_unreachable();
     }

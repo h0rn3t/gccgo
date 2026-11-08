@@ -34,6 +34,7 @@ class Channel_type;
 class Interface_type;
 class Named_type;
 class Forward_declaration_type;
+class Type_parameter;
 class Method;
 class Methods;
 class Type_hash_identical;
@@ -422,7 +423,10 @@ class Type
     TYPE_CHANNEL,
     TYPE_INTERFACE,
     TYPE_NAMED,
-    TYPE_FORWARD
+    TYPE_FORWARD,
+    // A type parameter has no core type of its own.  Its identity is
+    // the named type that wraps it.
+    TYPE_TYPE_PARAMETER
   };
 
   virtual ~Type();
@@ -566,6 +570,13 @@ class Type
 
   static Type*
   make_forward_declaration(Named_object*);
+
+  // A type parameter introduced by a type or function declaration.
+  // CONSTRAINT is the type written after the parameter name.  The
+  // underlying type of a type parameter is the type parameter itself.
+  static Type*
+  make_type_parameter(const std::string& name, Type* constraint,
+		      Location);
 
   // Make a builtin struct type from a list of fields.
   static Struct_type*
@@ -940,6 +951,16 @@ class Type
     return this->convert_no_base<const Forward_declaration_type,
 				 TYPE_FORWARD>();
   }
+
+  // If this is a type parameter, or a named type whose underlying
+  // type is a type parameter, return it.  Otherwise return NULL.
+  Type_parameter*
+  type_parameter()
+  { return this->convert<Type_parameter, TYPE_TYPE_PARAMETER>(); }
+
+  const Type_parameter*
+  type_parameter() const
+  { return this->convert<const Type_parameter, TYPE_TYPE_PARAMETER>(); }
 
   // Return true if this type is not yet defined.
   bool
@@ -3459,7 +3480,9 @@ class Named_type : public Type
       type_(type), local_methods_(NULL), all_methods_(NULL),
       interface_method_tables_(NULL), pointer_interface_method_tables_(NULL),
       location_(location), named_btype_(NULL), dependencies_(),
-      is_alias_(false), is_visible_(true), is_error_(false), in_heap_(true),
+      is_alias_(false), type_parameters_(NULL),
+      is_builtin_comparable_(false), is_visible_(true), is_error_(false),
+      in_heap_(true),
       is_placeholder_(false), is_converted_(false), is_verified_(false),
       seen_(false), seen_in_compare_is_identity_(false),
       seen_in_get_backend_(false), seen_alias_(false)
@@ -3490,6 +3513,30 @@ class Named_type : public Type
   void
   set_is_alias()
   { this->is_alias_ = true; }
+
+  // Type parameters of a generic type.  NULL when this is not generic.
+  // The list owns no separate lifetime from this type.
+  void
+  set_type_parameters(Typed_identifier_list* type_parameters)
+  { this->type_parameters_ = type_parameters; }
+
+  const Typed_identifier_list*
+  type_parameters() const
+  { return this->type_parameters_; }
+
+  bool
+  has_type_parameters() const
+  { return this->type_parameters_ != NULL; }
+
+  // The predeclared interface comparable.  It is a named empty
+  // interface, distinguished so it is not treated as any.
+  void
+  set_is_builtin_comparable()
+  { this->is_builtin_comparable_ = true; }
+
+  bool
+  is_builtin_comparable() const
+  { return this->is_builtin_comparable_; }
 
   // Mark this type as not permitted in the heap.
   void
@@ -3664,8 +3711,7 @@ class Named_type : public Type
   do_message_name(std::string* ret) const;
 
   int
-  do_traverse(Traverse* traverse)
-  { return Type::traverse(this->type_, traverse); }
+  do_traverse(Traverse*);
 
   bool
   do_verify(Gogo*);
@@ -3745,6 +3791,10 @@ class Named_type : public Type
   std::vector<Named_type*> dependencies_;
   // Whether this is an alias type.
   bool is_alias_;
+  // Type parameters for a generic type.  NULL if this type has none.
+  Typed_identifier_list* type_parameters_;
+  // True for the predeclared comparable interface.
+  bool is_builtin_comparable_;
   // Whether this type is visible.  This is false if this type was
   // created because it was referenced by an imported object, but the
   // type itself was not exported.  This will always be true for types
@@ -3879,6 +3929,84 @@ class Forward_declaration_type : public Type
   Named_object* named_object_;
   // Whether we have issued a warning about this type.
   mutable bool warned_;
+};
+
+// A type parameter.  This is the underlying type of the named type
+// that is in scope for the parameter.  It is not a constraint and not
+// an empty interface: with no core type, the underlying type is the
+// type parameter itself.
+
+class Type_parameter : public Type
+{
+ public:
+  Type_parameter(const std::string& name, Type* constraint, Location location)
+    : Type(TYPE_TYPE_PARAMETER),
+      name_(name), constraint_(constraint), location_(location),
+      reported_error_(false)
+  { }
+
+  const std::string&
+  name() const
+  { return this->name_; }
+
+  Type*
+  constraint()
+  { return this->constraint_; }
+
+  const Type*
+  constraint() const
+  { return this->constraint_; }
+
+  // Set after the name is bound, so the constraint can refer to this
+  // parameter or an earlier one in the same list.
+  void
+  set_constraint(Type* constraint)
+  { this->constraint_ = constraint; }
+
+  Location
+  location() const
+  { return this->location_; }
+
+ protected:
+  void
+  do_message_name(std::string* ret) const
+  { ret->append(this->name_); }
+
+  int
+  do_traverse(Traverse*);
+
+  bool
+  do_verify(Gogo*);
+
+  bool
+  do_compare_is_identity(Gogo*)
+  { return false; }
+
+  Btype*
+  do_get_backend(Gogo*);
+
+  Expression*
+  do_type_descriptor(Gogo*, Named_type*);
+
+  void
+  do_reflection(Gogo*, std::string* ret) const
+  { ret->append(this->name_); }
+
+  void
+  do_mangled_name(Gogo*, std::string* ret, bool*) const
+  { ret->append(this->name_); }
+
+  void
+  do_export(Export*) const;
+
+ private:
+  void
+  report_misuse(const char* msg) const;
+
+  std::string name_;
+  Type* constraint_;
+  Location location_;
+  mutable bool reported_error_;
 };
 
 // The Type_context struct describes what we expect for the type of an

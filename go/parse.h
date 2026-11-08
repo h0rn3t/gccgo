@@ -172,6 +172,13 @@ class Parse
   Type* channel_type();
   void check_signature_names(const Typed_identifier_list*, Names*);
   Function_type* signature(Typed_identifier*, Location);
+  // Type parameters.  The current token is '['.  Bindings for the
+  // names are already installed on Gogo.
+  Typed_identifier_list* type_parameter_list();
+  Type* type_constraint();
+  // Current token is '['.  True when this bracket starts a type
+  // parameter list rather than an array length.  Tokens are put back.
+  bool bracket_introduces_type_parameters();
   bool parameters(Typed_identifier_list**, bool* is_varargs);
   Typed_identifier_list* parameter_list(bool* is_varargs);
   void parameter_decl(bool, Typed_identifier_list*, bool*, bool*, bool*);
@@ -310,6 +317,13 @@ class Parse
   Token unget_token_;
   // Whether unget_token_ is valid.
   bool unget_token_valid_;
+  // Tokens put back by a multi-token lookahead.  The one-token unget
+  // above is unchanged: parameter lists depend on advance dropping a
+  // single unget and returning the already buffered token.  This
+  // buffer is consulted first.  Its front is the current token.
+  std::vector<Token> replay_;
+  // Stable token returned by peek and advance while replaying.
+  Token replay_token_;
   // Whether the function we are parsing had errors in the signature.
   bool is_erroneous_function_;
   // The code we are generating.

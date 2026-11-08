@@ -141,6 +141,11 @@ go_parse_input_files(const char** filenames, unsigned int filename_count,
   // Check types and issue errors as appropriate.
   ::gogo->check_types();
 
+  // Generic declarations have been type-checked.  Drop them from the
+  // definition list so later passes do not lower or emit a function
+  // or type that still contains type parameters.
+  ::gogo->hide_uninstantiated_generics();
+
   // Now that we have seen all the names and we know all the types,
   // lower the parse tree into a form which is easier to use.
   ::gogo->lower_parse_tree();

@@ -508,6 +508,27 @@ class Gogo
   Named_object*
   lookup(const std::string&, Named_object** pfunction) const;
 
+  // Type parameters currently being parsed.  The parser installs this
+  // while reading a signature or a type literal, then clears it.
+  // Lookup consults it before the open function blocks.  It is not
+  // current_bindings: declarations must still land in the function
+  // or the package.
+  void
+  set_type_parameter_bindings(Bindings* bindings)
+  { this->type_parameter_bindings_ = bindings; }
+
+  Bindings*
+  type_parameter_bindings() const
+  { return this->type_parameter_bindings_; }
+
+  // Drop generic functions and generic named types from the
+  // definition list after type checking.  They stay in the lookup
+  // map.  Later passes must not lower or emit an uninstantiated
+  // generic; a use still reports an error if it asks for a backend
+  // type.
+  void
+  hide_uninstantiated_generics();
+
   // Look up a name in the current block.
   Named_object*
   lookup_in_block(const std::string&) const;
@@ -1270,6 +1291,9 @@ class Gogo
   // The global binding contour.  This includes the builtin functions
   // and the package we are compiling.
   Bindings* globals_;
+  // Type-parameter bindings installed by the parser.  NULL when not
+  // parsing a generic signature or type.
+  Bindings* type_parameter_bindings_;
   // The list of names we have seen in the file block.
   File_block_names file_block_names_;
   // Mapping from import file names to packages.
@@ -1493,6 +1517,19 @@ class Function
   Function_type*
   type() const
   { return this->type_; }
+
+  // Type parameters of a generic function.  NULL when it has none.
+  void
+  set_type_parameters(Typed_identifier_list* type_parameters)
+  { this->type_parameters_ = type_parameters; }
+
+  const Typed_identifier_list*
+  type_parameters() const
+  { return this->type_parameters_; }
+
+  bool
+  has_type_parameters() const
+  { return this->type_parameters_ != NULL; }
 
   // Return the enclosing function if there is one.
   Named_object*
@@ -1842,6 +1879,8 @@ class Function
 
   // The function's type.
   Function_type* type_;
+  // Type parameters.  NULL if this function is not generic.
+  Typed_identifier_list* type_parameters_;
   // The enclosing function.  This is NULL when there isn't one, which
   // is the normal case.
   Named_object* enclosing_;
@@ -1953,14 +1992,26 @@ class Function_declaration
 {
  public:
   Function_declaration(Function_type* fntype, Location location)
-    : fntype_(fntype), location_(location), asm_name_(), descriptor_(NULL),
-      fndecl_(NULL), pragmas_(0), imported_body_(),
-      is_on_inlinable_list_(false)
+    : fntype_(fntype), type_parameters_(NULL), location_(location),
+      asm_name_(), descriptor_(NULL), fndecl_(NULL), pragmas_(0),
+      imported_body_(), is_on_inlinable_list_(false)
   { }
 
   Function_type*
   type() const
   { return this->fntype_; }
+
+  void
+  set_type_parameters(Typed_identifier_list* type_parameters)
+  { this->type_parameters_ = type_parameters; }
+
+  const Typed_identifier_list*
+  type_parameters() const
+  { return this->type_parameters_; }
+
+  bool
+  has_type_parameters() const
+  { return this->type_parameters_ != NULL; }
 
   Location
   location() const
@@ -2073,6 +2124,8 @@ class Function_declaration
  private:
   // The type of the function.
   Function_type* fntype_;
+  // Type parameters.  NULL if this declaration is not generic.
+  Typed_identifier_list* type_parameters_;
   // The location of the declaration.
   Location location_;
   // The assembler name: this is the name to use in references to the
@@ -3278,6 +3331,11 @@ class Bindings
   // Remove a name.
   void
   remove_binding(Named_object*);
+
+  // Remove one definition from the list that later passes walk.
+  // Lookup is unchanged, so the name can still be resolved.
+  void
+  remove_definition(Named_object*);
 
   // Mark all variables as used.  This is used for some types of parse
   // error.

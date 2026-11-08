@@ -33,6 +33,7 @@ Gogo::Gogo(Backend* backend, Linemap* linemap, int, int pointer_size)
     package_(NULL),
     functions_(),
     globals_(new Bindings(NULL)),
+    type_parameter_bindings_(NULL),
     file_block_names_(),
     imports_(),
     imported_unsafe_(false),
@@ -151,6 +152,17 @@ Gogo::Gogo(Backend* backend, Linemap* linemap, int, int pointer_size)
     Named_object* no = Named_object::make_type("any", NULL, empty, loc);
     Named_type* nt = no->type_value();
     nt->set_is_alias();
+    this->add_named_type(nt);
+  }
+
+  // "comparable" is the predeclared interface implemented by
+  // comparable types.  It is not an alias of any.
+  {
+    Type* empty = Type::make_empty_interface_type(loc);
+    Named_object* no = Named_object::make_type("comparable", NULL, empty,
+					       loc);
+    Named_type* nt = no->type_value();
+    nt->set_is_builtin_comparable();
     this->add_named_type(nt);
   }
 
@@ -1802,6 +1814,13 @@ Gogo::lookup(const std::string& name, Named_object** pfunction) const
 
   if (Gogo::is_sink_name(name))
     return Named_object::make_sink();
+
+  if (this->type_parameter_bindings_ != NULL)
+    {
+      Named_object* ret = this->type_parameter_bindings_->lookup_local(name);
+      if (ret != NULL)
+	return ret;
+    }
 
   for (Open_functions::const_reverse_iterator p = this->functions_.rbegin();
        p != this->functions_.rend();
@@ -5499,6 +5518,32 @@ Gogo::convert_named_types()
   Type::finish_pointer_types(this);
 }
 
+// Remove uninstantiated generic declarations from the definition list.
+// Type checking has already walked them.  The names remain visible so
+// a later reference can still say the type or function was not
+// instantiated, instead of reporting it as undefined.
+
+void
+Gogo::hide_uninstantiated_generics()
+{
+  if (this->package_ == NULL)
+    return;
+  Bindings* bindings = this->package_->bindings();
+  std::vector<Named_object*> drop;
+  for (Bindings::const_definitions_iterator p = bindings->begin_definitions();
+       p != bindings->end_definitions();
+       ++p)
+    {
+      Named_object* no = *p;
+      if (no->is_function() && no->func_value()->has_type_parameters())
+	drop.push_back(no);
+      else if (no->is_type() && no->type_value()->has_type_parameters())
+	drop.push_back(no);
+    }
+  for (size_t i = 0; i < drop.size(); ++i)
+    bindings->remove_definition(drop[i]);
+}
+
 // Convert all names types in a set of bindings.
 
 void
@@ -5508,7 +5553,7 @@ Gogo::convert_named_types_in_bindings(Bindings* bindings)
        p != bindings->end_definitions();
        ++p)
     {
-      if ((*p)->is_type())
+      if ((*p)->is_type() && !(*p)->type_value()->has_type_parameters())
 	(*p)->type_value()->convert(this);
     }
 }
@@ -5540,7 +5585,7 @@ Gogo::debug_dump()
 
 Function::Function(Function_type* type, Named_object* enclosing, Block* block,
 		   Location location)
-  : type_(type), enclosing_(enclosing), results_(NULL),
+  : type_(type), type_parameters_(NULL), enclosing_(enclosing), results_(NULL),
     closure_var_(NULL), block_(block), location_(location), labels_(),
     local_type_count_(0), descriptor_(NULL), fndecl_(NULL), defer_stack_(NULL),
     pragmas_(0), nested_functions_(0), is_sink_(false),
@@ -8966,7 +9011,8 @@ Named_object::get_backend(Gogo* gogo, std::vector<Bexpression*>& const_decls,
         if (named_type->is_alias())
           break;
 
-	if (!Gogo::is_erroneous_name(this->name_))
+	if (!Gogo::is_erroneous_name(this->name_)
+	    && !named_type->has_type_parameters())
 	  type_decls.push_back(named_type->get_backend(gogo));
 
         // We need to produce a type descriptor for every named
@@ -8976,7 +9022,8 @@ Named_object::get_backend(Gogo* gogo, std::vector<Bexpression*>& const_decls,
         // still be returned by some function.  Simply calling the
         // type_descriptor method is enough to create the type
         // descriptor, even though we don't do anything with it.
-        if (this->package_ == NULL && !saw_errors())
+        if (this->package_ == NULL && !saw_errors()
+	    && !named_type->has_type_parameters())
           {
             named_type->
                 type_descriptor_pointer(gogo, Linemap::predeclared_location());
@@ -9005,6 +9052,8 @@ Named_object::get_backend(Gogo* gogo, std::vector<Bexpression*>& const_decls,
     case NAMED_OBJECT_FUNC:
       {
 	Function* func = this->u_.func_value;
+	if (func->has_type_parameters())
+	  break;
 	if (!Gogo::is_erroneous_name(this->name_))
 	  func_decls.push_back(func->get_or_make_decl(gogo, this));
 
@@ -9085,6 +9134,22 @@ Bindings::lookup_local(const std::string& name) const
 
 // Remove an object from a set of bindings.  This is used for a
 // special case in thunks for functions which call recover.
+
+void
+Bindings::remove_definition(Named_object* no)
+{
+  for (std::vector<Named_object*>::iterator pn = this->named_objects_.begin();
+       pn != this->named_objects_.end();
+       ++pn)
+    {
+      if (*pn == no)
+	{
+	  this->named_objects_.erase(pn);
+	  return;
+	}
+    }
+  go_unreachable();
+}
 
 void
 Bindings::remove_binding(Named_object* no)

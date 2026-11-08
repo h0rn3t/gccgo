@@ -429,6 +429,9 @@ Token::print(FILE* file) const
 	case OPERATOR_RSQUARE:
 	  fprintf(file, "]");
 	  break;
+	case OPERATOR_TILDE:
+	  fprintf(file, "~");
+	  break;
 	default:
 	  go_unreachable();
 	}
@@ -690,6 +693,7 @@ Lex::next_token()
 	    case '(': case ')':
 	    case '{': case '}':
 	    case '[': case ']':
+	    case '~':
 	      {
 		this->add_semi_at_eol_ = false;
 		Operator op = this->two_character_operator(cc, p[1]);
@@ -1837,6 +1841,8 @@ Lex::one_character_operator(char c)
     case ']':
       this->add_semi_at_eol_ = true;
       return OPERATOR_RSQUARE;
+    case '~':
+      return OPERATOR_TILDE;
     default:
       return OPERATOR_INVALID;
     }

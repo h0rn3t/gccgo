@@ -1797,6 +1797,17 @@ class For_range_statement : public Statement
 		      Temporary_statement*, Block**, Expression**, Block**,
 		      Block**);
 
+  void
+  lower_range_integer(Gogo*, Block*, Type*, Named_object*,
+		      Temporary_statement*, Temporary_statement*,
+		      Block**, Expression**, Block**);
+
+  // Each variable declared by := gets its own storage for this
+  // iteration.  The returned block is the per-iteration copies, to
+  // run after the iteration values are assigned and before the body.
+  Block*
+  per_iteration_vars(Gogo*, Block* enclosing);
+
   Statement*
   lower_map_range_clear(Gogo*, Type*, Block*, Expression*, Named_object*,
                         Temporary_statement*, Location);

@@ -2595,6 +2595,15 @@ class Variable
   set_type_from_range_value()
   { this->type_from_range_value_ = true; }
 
+  // Whether this variable was declared by a range clause.
+  bool
+  is_type_from_range_index() const
+  { return this->type_from_range_index_; }
+
+  bool
+  is_type_from_range_value() const
+  { return this->type_from_range_value_; }
+
   // Another special case: the init value is used only to determine
   // the type.  This is used if the variable is defined using := with
   // a case in a select statement.  The init value is the channel.

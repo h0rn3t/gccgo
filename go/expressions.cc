@@ -9363,6 +9363,8 @@ Builtin_call_expression::Builtin_call_expression(Gogo* gogo,
     this->code_ = BUILTIN_APPEND;
   else if (name == "cap")
     this->code_ = BUILTIN_CAP;
+  else if (name == "clear")
+    this->code_ = BUILTIN_CLEAR;
   else if (name == "close")
     this->code_ = BUILTIN_CLOSE;
   else if (name == "complex")
@@ -9377,6 +9379,10 @@ Builtin_call_expression::Builtin_call_expression(Gogo* gogo,
     this->code_ = BUILTIN_LEN;
   else if (name == "make")
     this->code_ = BUILTIN_MAKE;
+  else if (name == "max")
+    this->code_ = BUILTIN_MAX;
+  else if (name == "min")
+    this->code_ = BUILTIN_MIN;
   else if (name == "new")
     this->code_ = BUILTIN_NEW;
   else if (name == "panic")
@@ -9473,6 +9479,26 @@ Builtin_call_expression::do_lower(Gogo* gogo, Named_object* function,
 	  ret->determine_type(gogo, &subcontext);
 	  return ret;
 	}
+
+      if (this->code_ == BUILTIN_MIN || this->code_ == BUILTIN_MAX)
+	{
+	  std::string sval;
+	  if (this->string_constant_value(&sval))
+	    {
+	      Type* result_type = this->type();
+	      Expression* ret;
+	      if (result_type == NULL || result_type->is_abstract())
+		ret = Expression::make_string(sval, loc);
+	      else
+		ret = Expression::make_string_typed(sval, result_type, loc);
+	      Type_context subcontext;
+	      if (result_type != NULL)
+		subcontext = Type_context(result_type,
+					  result_type->is_abstract());
+	      ret->determine_type(gogo, &subcontext);
+	      return ret;
+	    }
+	}
     }
 
   switch (this->code_)
@@ -9558,6 +9584,13 @@ Builtin_call_expression::do_flatten(Gogo* gogo, Named_object* function,
 
     case BUILTIN_APPEND:
       return this->flatten_append(gogo, function, inserter, NULL, NULL);
+
+    case BUILTIN_MIN:
+    case BUILTIN_MAX:
+      return this->flatten_min_max(gogo, function, inserter);
+
+    case BUILTIN_CLEAR:
+      return this->flatten_clear(gogo, function, inserter);
 
     case BUILTIN_COPY:
       {
@@ -9927,6 +9960,321 @@ Builtin_call_expression::do_flatten(Gogo* gogo, Named_object* function,
     }
 
   return this;
+}
+
+// An ordered type is an integer, floating-point, or string type.
+// Complex and boolean types are not ordered.
+
+static bool
+min_max_ordered_type(Type* t)
+{
+  return (t != NULL
+	  && !t->is_error()
+	  && (t->integer_type() != NULL
+	      || t->float_type() != NULL
+	      || t->is_string_type()));
+}
+
+// Determine types for min and max.  The result type follows the same
+// rule as addition: min(x, y) has the type of x + y.
+
+void
+Builtin_call_expression::determine_min_max(Gogo* gogo,
+					   const Type_context* context)
+{
+  const Expression_list* args = this->args();
+  if (args == NULL || args->empty())
+    {
+      this->report_error(_("not enough arguments"));
+      return;
+    }
+
+  bool any_typed = false;
+  for (Expression_list::const_iterator pa = args->begin();
+       pa != args->end();
+       ++pa)
+    {
+      Type* dummy;
+      if (!(*pa)->is_untyped(&dummy))
+	any_typed = true;
+    }
+
+  if (any_typed)
+    {
+      for (Expression_list::const_iterator pa = args->begin();
+	   pa != args->end();
+	   ++pa)
+	{
+	  Type* dummy;
+	  if (!(*pa)->is_untyped(&dummy))
+	    (*pa)->determine_type_no_context(gogo);
+	}
+
+      Type* concrete = NULL;
+      for (Expression_list::const_iterator pa = args->begin();
+	   pa != args->end();
+	   ++pa)
+	{
+	  Type* dummy;
+	  if ((*pa)->is_untyped(&dummy))
+	    continue;
+	  Type* at = (*pa)->type();
+	  if (concrete == NULL)
+	    concrete = at;
+	  else
+	    {
+	      Type* merged;
+	      if (Binary_expression::operation_type(OPERATOR_PLUS, concrete,
+						    at, &merged))
+		concrete = merged;
+	    }
+	}
+
+      bool abstract = concrete != NULL && concrete->is_abstract();
+      Type_context sub(concrete, abstract);
+      for (Expression_list::const_iterator pa = args->begin();
+	   pa != args->end();
+	   ++pa)
+	{
+	  Type* dummy;
+	  if ((*pa)->is_untyped(&dummy))
+	    (*pa)->determine_type(gogo, &sub);
+	}
+    }
+  else
+    {
+      Type_context sub(NULL, true);
+      for (Expression_list::const_iterator pa = args->begin();
+	   pa != args->end();
+	   ++pa)
+	(*pa)->determine_type(gogo, &sub);
+    }
+
+  Type* result = NULL;
+  for (Expression_list::const_iterator pa = args->begin();
+       pa != args->end();
+       ++pa)
+    {
+      Type* at = (*pa)->type();
+      if (at->is_error() || !min_max_ordered_type(at))
+	{
+	  this->set_type(Type::make_error_type());
+	  return;
+	}
+      if (result == NULL)
+	{
+	  result = at;
+	  continue;
+	}
+      Type* merged;
+      if (!Type::are_compatible_for_binop(result, at)
+	  || !Binary_expression::operation_type(OPERATOR_PLUS, result, at,
+						&merged))
+	{
+	  this->set_type(Type::make_error_type());
+	  return;
+	}
+      result = merged;
+    }
+
+  if (result->is_abstract()
+      && !context->may_be_abstract
+      && context->type != NULL
+      && context->type->interface_type() == NULL
+      && ((result->is_numeric_type() && context->type->is_numeric_type())
+	  || (result->is_string_type() && context->type->is_string_type())))
+    result = context->type;
+  else if (result->is_abstract() && !context->may_be_abstract)
+    result = result->make_non_abstract_type();
+
+  this->set_type(result);
+}
+
+// Lower min or max to a left-to-right comparison.  Arguments are
+// evaluated once, in order.  For floating-point values a NaN argument
+// wins, matching the language specification.  Equal values keep the
+// earlier argument.
+
+Expression*
+Builtin_call_expression::flatten_min_max(Gogo* gogo, Named_object* function,
+					 Statement_inserter* inserter)
+{
+  Location loc = this->location();
+  const Expression_list* args = this->args();
+  go_assert(args != NULL && !args->empty());
+
+  Type* result_type = this->type();
+  if (result_type == NULL || result_type->is_error())
+    return Expression::make_error(loc);
+  if (result_type->is_abstract())
+    result_type = result_type->make_non_abstract_type();
+
+  bool is_float = result_type->float_type() != NULL;
+  Operator cmp_op = (this->code_ == BUILTIN_MIN ? OPERATOR_LT : OPERATOR_GT);
+
+  Temporary_statement* cur_temp = NULL;
+  for (Expression_list::const_iterator pa = args->begin();
+       pa != args->end();
+       ++pa)
+    {
+      Expression* arg = *pa;
+      if (!Type::are_identical(arg->type(), result_type, Type::COMPARE_TAGS,
+			       NULL))
+	arg = Expression::make_cast(result_type, arg, loc);
+
+      Temporary_statement* arg_temp = Statement::make_temporary(result_type,
+								arg, loc);
+      arg_temp->determine_types(gogo);
+      inserter->insert(arg_temp);
+
+      if (cur_temp == NULL)
+	{
+	  cur_temp = arg_temp;
+	  continue;
+	}
+
+      Expression* cur = Expression::make_temporary_reference(cur_temp, loc);
+      Expression* nxt = Expression::make_temporary_reference(arg_temp, loc);
+      Expression* cmp = Expression::make_binary(cmp_op, nxt, cur, loc);
+      Expression* selected;
+      if (is_float)
+	{
+	  Expression* nxt_nan = Expression::make_temporary_reference(arg_temp,
+								    loc);
+	  Expression* nan = Expression::make_binary(OPERATOR_NOTEQ, nxt_nan,
+						    nxt_nan->copy(), loc);
+	  Expression* when_ordered =
+	    Expression::make_conditional(cmp,
+					 Expression::make_temporary_reference(arg_temp, loc),
+					 Expression::make_temporary_reference(cur_temp, loc),
+					 loc);
+	  selected = Expression::make_conditional(nan,
+						  Expression::make_temporary_reference(arg_temp, loc),
+						  when_ordered, loc);
+	}
+      else
+	selected = Expression::make_conditional(cmp,
+						nxt->copy(),
+						cur->copy(), loc);
+
+      selected->determine_type_no_context(gogo);
+      gogo->lower_expression(function, inserter, &selected);
+      gogo->flatten_expression(function, inserter, &selected);
+
+      Temporary_statement* sel_temp = Statement::make_temporary(result_type,
+								selected, loc);
+      sel_temp->determine_types(gogo);
+      inserter->insert(sel_temp);
+      cur_temp = sel_temp;
+    }
+
+  return Expression::make_temporary_reference(cur_temp, loc);
+}
+
+// Lower clear to runtime.mapclear or a guarded memclr of the slice
+// elements.  A nil or empty value is left unchanged.
+
+Expression*
+Builtin_call_expression::flatten_clear(Gogo* gogo, Named_object* function,
+				       Statement_inserter* inserter)
+{
+  Location loc = this->location();
+  Expression* arg = this->args()->front();
+  Type* arg_type = arg->type();
+
+  if (!arg->is_multi_eval_safe())
+    {
+      Temporary_statement* arg_temp = Statement::make_temporary(NULL, arg, loc);
+      arg_temp->determine_types(gogo);
+      inserter->insert(arg_temp);
+      arg = Expression::make_temporary_reference(arg_temp, loc);
+    }
+
+  if (arg_type->map_type() != NULL)
+    {
+      Temporary_statement* map_temp = Statement::make_temporary(arg_type, arg,
+								loc);
+      map_temp->determine_types(gogo);
+      inserter->insert(map_temp);
+
+      Expression* td = Expression::make_type_descriptor(arg_type, loc);
+      Expression* mref = Expression::make_temporary_reference(map_temp, loc);
+      Expression* call = Runtime::make_call(gogo, Runtime::MAPCLEAR, loc, 2,
+					    td, mref);
+      call->determine_type_no_context(gogo);
+      return call;
+    }
+
+  go_assert(arg_type->is_slice_type());
+
+  Named_object* lenfn = gogo->lookup_global("len");
+  Expression* lenref = Expression::make_func_reference(lenfn, NULL, loc);
+  Expression_list* len_args = new Expression_list();
+  len_args->push_back(arg->copy());
+  Expression* len_call = Expression::make_call(lenref, len_args, false, loc);
+  gogo->lower_expression(function, inserter, &len_call);
+  gogo->flatten_expression(function, inserter, &len_call);
+
+  Type* int_type = Type::lookup_integer_type("int");
+  Temporary_statement* len_temp = Statement::make_temporary(int_type, len_call,
+							    loc);
+  len_temp->determine_types(gogo);
+  inserter->insert(len_temp);
+
+  Type* elem_type = arg_type->array_type()->element_type();
+  Expression* zero = Expression::make_integer_ul(0, int_type, loc);
+  Expression* elem = Expression::make_array_index(arg->copy(), zero->copy(),
+						  NULL, NULL, loc);
+  elem->array_index_expression()->set_needs_bounds_check(false);
+  Expression* ptr = Expression::make_unary(OPERATOR_AND, elem, loc);
+
+  Type* uintptr_type = Type::lookup_integer_type("uintptr");
+  Expression* n = Expression::make_temporary_reference(len_temp, loc);
+  n = Expression::make_cast(uintptr_type, n, loc);
+  Expression* sz = Expression::make_type_info(elem_type, TYPE_INFO_SIZE);
+  sz = Expression::make_binary(OPERATOR_MULT, sz, n, loc);
+
+  Expression* call;
+  if (elem_type->has_pointer())
+    call = Runtime::make_call(gogo, Runtime::MEMCLRHASPTR, loc, 2, ptr, sz);
+  else
+    {
+      Type* int32_type = Type::lookup_integer_type("int32");
+      Expression* zero32 = Expression::make_integer_ul(0, int32_type, loc);
+      call = Runtime::make_call(gogo, Runtime::BUILTIN_MEMSET, loc, 3,
+				ptr, zero32, sz);
+    }
+  call->determine_type_no_context(gogo);
+
+  Block* then_block = new Block(NULL, loc);
+  Statement* call_stmt = Statement::make_statement(call, true);
+  call_stmt->determine_types(gogo);
+  then_block->add_statement(call_stmt);
+
+  Expression* len_cmp = Expression::make_temporary_reference(len_temp, loc);
+  Expression* cond = Expression::make_binary(OPERATOR_NOTEQ, len_cmp, zero,
+					     loc);
+  Statement* ifs = Statement::make_if_statement(cond, then_block, NULL, loc);
+  ifs->determine_types(gogo);
+  inserter->insert(ifs);
+
+  // The clear is done by the inserted statement.  The call expression
+  // itself has no result.
+  Type* byte_type = Type::lookup_integer_type("uint8");
+  Expression* dummy_zero = Expression::make_integer_ul(0, byte_type, loc);
+  Temporary_statement* dummy = Statement::make_temporary(byte_type, dummy_zero,
+							 loc);
+  dummy->determine_types(gogo);
+  inserter->insert(dummy);
+  Expression* dummy_ref = Expression::make_temporary_reference(dummy, loc);
+  Expression* dummy_ptr = Expression::make_unary(OPERATOR_AND, dummy_ref, loc);
+  Type* int32_type = Type::lookup_integer_type("int32");
+  Expression* zero32 = Expression::make_integer_ul(0, int32_type, loc);
+  Expression* zero_sz = Expression::make_integer_ul(0, uintptr_type, loc);
+  Expression* nop = Runtime::make_call(gogo, Runtime::BUILTIN_MEMSET, loc, 3,
+				       dummy_ptr, zero32, zero_sz);
+  nop->determine_type_no_context(gogo);
+  return nop;
 }
 
 // Lower a make expression.
@@ -10740,6 +11088,30 @@ Builtin_call_expression::do_is_constant() const
       }
       break;
 
+    case BUILTIN_MIN:
+    case BUILTIN_MAX:
+      {
+	if (this->seen_)
+	  return false;
+	const Expression_list* args = this->args();
+	if (args == NULL || args->empty())
+	  return false;
+	this->seen_ = true;
+	bool ret = true;
+	for (Expression_list::const_iterator pa = args->begin();
+	     pa != args->end();
+	     ++pa)
+	  {
+	    if (!(*pa)->is_constant())
+	      {
+		ret = false;
+		break;
+	      }
+	  }
+	this->seen_ = false;
+	return ret;
+      }
+
     case BUILTIN_REAL:
     case BUILTIN_IMAG:
       {
@@ -10791,6 +11163,37 @@ Builtin_call_expression::do_is_untyped(Type** ptype) const
 	  return false;
 	*ptype = Type::make_abstract_float_type();
 	return true;
+      }
+
+    case BUILTIN_MIN:
+    case BUILTIN_MAX:
+      {
+	if (this->type() != NULL && !this->type()->is_abstract())
+	  return false;
+	const Expression_list* args = this->args();
+	if (args == NULL || args->empty())
+	  return false;
+	Type* merged = NULL;
+	for (Expression_list::const_iterator pa = args->begin();
+	     pa != args->end();
+	     ++pa)
+	  {
+	    Type* at;
+	    if (!(*pa)->is_untyped(&at))
+	      return false;
+	    if (merged == NULL)
+	      merged = at;
+	    else
+	      {
+		Type* next;
+		if (!Binary_expression::operation_type(OPERATOR_PLUS, merged,
+						       at, &next))
+		  return false;
+		merged = next;
+	      }
+	  }
+	*ptype = this->type() != NULL ? this->type() : merged;
+	return *ptype != NULL;
       }
     }
 }
@@ -11028,7 +11431,101 @@ Builtin_call_expression::do_numeric_constant_value(Numeric_constant* nc)
       return true;
     }
 
+  if (this->code_ == BUILTIN_MIN || this->code_ == BUILTIN_MAX)
+    {
+      if (this->seen_)
+	return false;
+      const Expression_list* args = this->args();
+      if (args == NULL || args->empty())
+	return false;
+
+      this->seen_ = true;
+      Numeric_constant best;
+      bool have = false;
+      bool ok = true;
+      for (Expression_list::const_iterator pa = args->begin();
+	   pa != args->end();
+	   ++pa)
+	{
+	  Numeric_constant cur;
+	  if (!(*pa)->numeric_constant_value(&cur))
+	    {
+	      ok = false;
+	      break;
+	    }
+	  if (!have)
+	    {
+	      best = cur;
+	      have = true;
+	      continue;
+	    }
+	  Numeric_constant left = cur;
+	  Numeric_constant right = best;
+	  bool take;
+	  Operator op = (this->code_ == BUILTIN_MIN
+			 ? OPERATOR_LT
+			 : OPERATOR_GT);
+	  if (!Binary_expression::compare_constant(op, &left, &right,
+						   this->location(), &take))
+	    {
+	      ok = false;
+	      break;
+	    }
+	  if (take)
+	    best = cur;
+	}
+      this->seen_ = false;
+      if (!ok || !have)
+	return false;
+      *nc = best;
+      return true;
+    }
+
   return false;
+}
+
+bool
+Builtin_call_expression::do_string_constant_value(std::string* val)
+{
+  if (this->code_ != BUILTIN_MIN && this->code_ != BUILTIN_MAX)
+    return false;
+  if (this->seen_)
+    return false;
+
+  const Expression_list* args = this->args();
+  if (args == NULL || args->empty())
+    return false;
+
+  this->seen_ = true;
+  std::string best;
+  bool have = false;
+  bool ok = true;
+  for (Expression_list::const_iterator pa = args->begin();
+       pa != args->end();
+       ++pa)
+    {
+      std::string cur;
+      if (!(*pa)->string_constant_value(&cur))
+	{
+	  ok = false;
+	  break;
+	}
+      if (!have)
+	{
+	  best = cur;
+	  have = true;
+	  continue;
+	}
+      int cmp = cur.compare(best);
+      bool take = this->code_ == BUILTIN_MIN ? cmp < 0 : cmp > 0;
+      if (take)
+	best = cur;
+    }
+  this->seen_ = false;
+  if (!ok || !have)
+    return false;
+  *val = best;
+  return true;
 }
 
 // Give an error if we are discarding the value of an expression which
@@ -11053,6 +11550,8 @@ Builtin_call_expression::do_discarding_value()
     case BUILTIN_MAKE:
     case BUILTIN_NEW:
     case BUILTIN_REAL:
+    case BUILTIN_MIN:
+    case BUILTIN_MAX:
     case BUILTIN_ADD:
     case BUILTIN_ALIGNOF:
     case BUILTIN_OFFSETOF:
@@ -11062,6 +11561,7 @@ Builtin_call_expression::do_discarding_value()
       return false;
 
     case BUILTIN_CLOSE:
+    case BUILTIN_CLEAR:
     case BUILTIN_COPY:
     case BUILTIN_DELETE:
     case BUILTIN_PANIC:
@@ -11117,6 +11617,7 @@ Builtin_call_expression::do_type()
       return Type::lookup_integer_type("uintptr");
 
     case BUILTIN_CLOSE:
+    case BUILTIN_CLEAR:
     case BUILTIN_DELETE:
     case BUILTIN_PANIC:
     case BUILTIN_PRINT:
@@ -11150,6 +11651,36 @@ Builtin_call_expression::do_type()
 	if (t == NULL)
 	  t = Type::make_error_type();
 	return t;
+      }
+
+    case BUILTIN_MIN:
+    case BUILTIN_MAX:
+      {
+	const Expression_list* args = this->args();
+	if (args == NULL || args->empty())
+	  return Type::make_error_type();
+	Type* result = NULL;
+	for (Expression_list::const_iterator pa = args->begin();
+	     pa != args->end();
+	     ++pa)
+	  {
+	    Type* at = (*pa)->type();
+	    if (at->is_error())
+	      return Type::make_error_type();
+	    if (result == NULL)
+	      result = at;
+	    else
+	      {
+		Type* merged;
+		if (!Binary_expression::operation_type(OPERATOR_PLUS, result,
+						       at, &merged))
+		  return Type::make_error_type();
+		result = merged;
+	      }
+	  }
+	if (result == NULL)
+	  return Type::make_error_type();
+	return result;
       }
 
     case BUILTIN_COMPLEX:
@@ -11371,6 +11902,21 @@ Builtin_call_expression::do_determine_type(Gogo* gogo,
 	}
       is_print = false;
       break;
+
+    case BUILTIN_CLEAR:
+      if (args != NULL)
+	{
+	  for (Expression_list::const_iterator pa = args->begin();
+	       pa != args->end();
+	       ++pa)
+	    (*pa)->determine_type_no_context(gogo);
+	}
+      return;
+
+    case BUILTIN_MIN:
+    case BUILTIN_MAX:
+      this->determine_min_max(gogo, context);
+      return;
 
     default:
       is_print = false;
@@ -11904,6 +12450,78 @@ Builtin_call_expression::do_check_types(Gogo* gogo)
       }
       break;
 
+    case BUILTIN_CLEAR:
+      if (!this->check_one_arg())
+	break;
+      {
+	Type* arg_type = this->one_arg()->type();
+	if (arg_type->map_type() == NULL && !arg_type->is_slice_type())
+	  this->report_error(_("argument must be a map or a slice"));
+      }
+      break;
+
+    case BUILTIN_MIN:
+    case BUILTIN_MAX:
+      {
+	const Expression_list* args = this->args();
+	if (args == NULL || args->empty())
+	  {
+	    this->report_error(_("not enough arguments"));
+	    break;
+	  }
+	Type* result = NULL;
+	for (Expression_list::const_iterator pa = args->begin();
+	     pa != args->end();
+	     ++pa)
+	  {
+	    Type* at = (*pa)->type();
+	    if ((*pa)->is_error_expression() || at->is_error())
+	      {
+		this->set_is_error();
+		return;
+	      }
+	    if (at->integer_type() == NULL
+		&& at->float_type() == NULL
+		&& !at->is_string_type())
+	      {
+		go_error_at((*pa)->location(),
+			    "invalid argument type for built-in %s",
+			    this->code_ == BUILTIN_MIN ? "min" : "max");
+		this->set_is_error();
+		return;
+	      }
+	    if (result == NULL)
+	      {
+		result = at;
+		continue;
+	      }
+	    if (!Type::are_compatible_for_binop(result, at))
+	      {
+		this->report_error(_("mismatched types"));
+		return;
+	      }
+	    if (!Binary_expression::check_operator_type(OPERATOR_PLUS,
+							result, at,
+							this->location())
+		|| !Binary_expression::check_operator_type(OPERATOR_PLUS,
+							   at, result,
+							   this->location()))
+	      {
+		this->set_is_error();
+		return;
+	      }
+	    Type* merged;
+	    if (!Binary_expression::operation_type(OPERATOR_PLUS, result, at,
+						   &merged))
+	      {
+		this->report_error(_("mismatched types"));
+		return;
+	      }
+	    result = merged;
+	  }
+      }
+      break;
+
     case BUILTIN_ADD:
     case BUILTIN_SLICE:
       {
@@ -12324,6 +12942,12 @@ Builtin_call_expression::do_get_backend(Translate_context* context)
       // Handled in Builtin_call_expression::do_flatten.
       go_unreachable();
 
+    case BUILTIN_MIN:
+    case BUILTIN_MAX:
+    case BUILTIN_CLEAR:
+      // Handled in Builtin_call_expression::do_flatten.
+      go_unreachable();
+
     case BUILTIN_APPEND:
       // Handled in Builtin_call_expression::flatten_append.
       go_unreachable();
@@ -12416,6 +13040,15 @@ Builtin_call_expression::do_export(Export_function_body* efb) const
 	  break;
 	case BUILTIN_COMPLEX:
 	  s = "complex";
+	  break;
+	case BUILTIN_MIN:
+	  s = "min";
+	  break;
+	case BUILTIN_MAX:
+	  s = "max";
+	  break;
+	case BUILTIN_CLEAR:
+	  s = "clear";
 	  break;
 	}
       efb->write_c_string(s);

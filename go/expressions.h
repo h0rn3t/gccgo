@@ -2826,6 +2826,9 @@ class Builtin_call_expression : public Call_expression
       BUILTIN_PRINTLN,
       BUILTIN_REAL,
       BUILTIN_RECOVER,
+      BUILTIN_CLEAR,
+      BUILTIN_MAX,
+      BUILTIN_MIN,
 
       // Builtin functions from the unsafe package.
       BUILTIN_ADD,
@@ -2869,6 +2872,9 @@ class Builtin_call_expression : public Call_expression
 
   bool
   do_numeric_constant_value(Numeric_constant*);
+
+  bool
+  do_string_constant_value(std::string*);
 
   bool
   do_discarding_value();
@@ -2916,6 +2922,15 @@ class Builtin_call_expression : public Call_expression
 
   Expression*
   lower_make(Gogo*, Statement_inserter*);
+
+  void
+  determine_min_max(Gogo*, const Type_context*);
+
+  Expression*
+  flatten_min_max(Gogo*, Named_object*, Statement_inserter*);
+
+  Expression*
+  flatten_clear(Gogo*, Named_object*, Statement_inserter*);
 
   bool
   check_int_value(Expression*, bool is_length, bool* small);

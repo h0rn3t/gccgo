@@ -6635,6 +6635,169 @@ For_statement::do_check_types(Gogo*)
     }
 }
 
+// The iteration type of an integer range.  A typed integer keeps its
+// type, including a named integer type.  An untyped constant uses the
+// preexisting iteration variable's type when that variable is an
+// integer, and int otherwise.
+
+static Type*
+integer_iteration_type(Type* range_type, Expression* index_var)
+{
+  if (range_type == NULL || range_type->integer_type() == NULL)
+    return NULL;
+  if (!range_type->is_abstract())
+    return range_type;
+  if (index_var != NULL && !index_var->is_sink_expression())
+    {
+      Type* lt = index_var->type();
+      if (lt != NULL && !lt->is_abstract() && lt->integer_type() != NULL
+	  && !lt->is_error_type() && !lt->is_sink_type())
+	return lt;
+    }
+  return Type::lookup_integer_type("int");
+}
+
+// Remember which loop variables the body mentions, then retarget those
+// references onto the per-iteration variable.
+
+class Find_loop_vars : public Traverse
+{
+ public:
+  Find_loop_vars(const std::vector<Named_object*>* vars)
+    : Traverse(traverse_expressions),
+      vars_(vars)
+  { }
+
+  const std::vector<Named_object*>&
+  found() const
+  { return this->found_; }
+
+ protected:
+  int
+  expression(Expression**);
+
+ private:
+  const std::vector<Named_object*>* vars_;
+  std::vector<Named_object*> found_;
+};
+
+int
+Find_loop_vars::expression(Expression** pexpr)
+{
+  Var_expression* ve = (*pexpr)->var_expression();
+  if (ve == NULL)
+    return TRAVERSE_CONTINUE;
+  Named_object* no = ve->named_object();
+  for (size_t i = 0; i < this->vars_->size(); ++i)
+    {
+      if ((*this->vars_)[i] != no)
+	continue;
+      size_t j;
+      for (j = 0; j < this->found_.size(); ++j)
+	{
+	  if (this->found_[j] == no)
+	    break;
+	}
+      if (j == this->found_.size())
+	this->found_.push_back(no);
+      break;
+    }
+  return TRAVERSE_CONTINUE;
+}
+
+class Rewrite_loop_vars : public Traverse
+{
+ public:
+  Rewrite_loop_vars(const std::vector<std::pair<Named_object*, Named_object*> >* vars)
+    : Traverse(traverse_expressions),
+      vars_(vars)
+  { }
+
+ protected:
+  int
+  expression(Expression**);
+
+ private:
+  const std::vector<std::pair<Named_object*, Named_object*> >* vars_;
+};
+
+int
+Rewrite_loop_vars::expression(Expression** pexpr)
+{
+  Var_expression* ve = (*pexpr)->var_expression();
+  if (ve == NULL)
+    return TRAVERSE_CONTINUE;
+  Named_object* no = ve->named_object();
+  for (size_t i = 0; i < this->vars_->size(); ++i)
+    {
+      if ((*this->vars_)[i].first != no)
+	continue;
+      *pexpr = Expression::make_var_reference((*this->vars_)[i].second,
+					      (*pexpr)->location());
+      return TRAVERSE_CONTINUE;
+    }
+  return TRAVERSE_CONTINUE;
+}
+
+// Give each variable in VARS that the body mentions its own storage for
+// this iteration.  Declarations of the copies go in DECLS, which runs
+// after the iteration value is stored in the original variable.
+// COPY_BACK, when not NULL, receives assignments of those copies back
+// to the originals so the post statement and the next iteration see
+// body mutations.  Range loops pass NULL: the next iteration value does
+// not come from the body.  Returns the number of copies created.
+// Variables the body never mentions are left alone so that an unused
+// declaration is still reported.
+
+static size_t
+install_per_iteration_vars(Gogo* gogo, Block* body, Block* decls,
+			   Block* copy_back,
+			   const std::vector<Named_object*>* vars)
+{
+  Find_loop_vars find(vars);
+  body->traverse(&find);
+  const std::vector<Named_object*>& found(find.found());
+  if (found.empty())
+    return 0;
+
+  Location loc = body->start_location();
+  std::vector<std::pair<Named_object*, Named_object*> > pairs;
+  pairs.reserve(found.size());
+  for (size_t i = 0; i < found.size(); ++i)
+    {
+      Named_object* orig = found[i];
+      Variable* ov = orig->var_value();
+      Expression* init = Expression::make_var_reference(orig, loc);
+      Variable* nv = new Variable(ov->type(), init, false, false, false, loc);
+      nv->set_is_used();
+      std::string name = orig->name();
+      name.append(".iter");
+      Named_object* neu = decls->bindings()->add_variable(name, NULL, nv);
+      pairs.push_back(std::make_pair(orig, neu));
+
+      Statement* ds = Statement::make_variable_declaration(neu);
+      ds->determine_types(gogo);
+      decls->add_statement(ds);
+    }
+
+  Rewrite_loop_vars rewrite(&pairs);
+  body->traverse(&rewrite);
+
+  if (copy_back != NULL)
+    {
+      for (size_t i = 0; i < pairs.size(); ++i)
+	{
+	  Expression* lhs = Expression::make_var_reference(pairs[i].first, loc);
+	  Expression* rhs = Expression::make_var_reference(pairs[i].second,
+							  loc);
+	  Statement* as = Statement::make_assignment(lhs, rhs, loc);
+	  as->determine_types(gogo);
+	  copy_back->add_statement(as);
+	}
+    }
+  return pairs.size();
+}
+
 // Lower a For_statement into if statements and gotos.  Getting rid of
 // complex statements make it easier to handle garbage collection.
 
@@ -6646,6 +6809,47 @@ For_statement::do_lower(Gogo* gogo, Named_object*, Block* enclosing,
 
   if (this->classification() == STATEMENT_ERROR)
     return Statement::make_error_statement(loc);
+
+  // The block that encloses a parsed for holds exactly the variables
+  // declared by := in its init statement.  Each iteration gets its own
+  // copy of those that the body mentions.  The condition and the post
+  // statement keep using the original variable.
+  std::vector<Named_object*> loop_vars;
+  if (enclosing != NULL)
+    {
+      Bindings* bindings = enclosing->bindings();
+      for (Bindings::const_definitions_iterator p =
+	     bindings->begin_definitions();
+	   p != bindings->end_definitions();
+	   ++p)
+	{
+	  if (!(*p)->is_variable() || Gogo::is_sink_name((*p)->name()))
+	    continue;
+	  Variable* var = (*p)->var_value();
+	  Type* type = var->type();
+	  if (type == NULL || type->is_error_type())
+	    continue;
+	  if (var->is_type_from_range_index()
+	      || var->is_type_from_range_value())
+	    continue;
+	  loop_vars.push_back(*p);
+	}
+    }
+
+  Block* iter_decls = NULL;
+  Block* copy_back = NULL;
+  if (!loop_vars.empty())
+    {
+      iter_decls = new Block(enclosing, loc);
+      copy_back = new Block(enclosing, loc);
+      if (install_per_iteration_vars(gogo, this->statements_, iter_decls,
+				     copy_back, &loop_vars)
+	  == 0)
+	{
+	  iter_decls = NULL;
+	  copy_back = NULL;
+	}
+    }
 
   Statement* s;
   Block* b = new Block(enclosing, this->location());
@@ -6667,6 +6871,11 @@ For_statement::do_lower(Gogo* gogo, Named_object*, Block* enclosing,
   top->set_derived_from(this);
   b->add_statement(Statement::make_unnamed_label_statement(top));
 
+  // The copy is declared inside the loop, so a variable that escapes
+  // is allocated once per iteration.
+  if (iter_decls != NULL)
+    b->add_statement(Statement::make_block_statement(iter_decls, loc));
+
   s = Statement::make_block_statement(this->statements_,
 				      this->statements_->start_location());
   b->add_statement(s);
@@ -6676,6 +6885,12 @@ For_statement::do_lower(Gogo* gogo, Named_object*, Block* enclosing,
   Unnamed_label* cont = this->continue_label_;
   if (cont != NULL)
     b->add_statement(Statement::make_unnamed_label_statement(cont));
+
+  // continue lands here, before the post statement.  Body mutations
+  // are copied back first, then the post statement advances the
+  // original variable and the next iteration copies it again.
+  if (copy_back != NULL)
+    b->add_statement(Statement::make_block_statement(copy_back, loc));
 
   if (this->post_ != NULL)
     {
@@ -6835,14 +7050,42 @@ For_range_statement::do_determine_types(Gogo* gogo)
     this->index_var_->determine_type_no_context(gogo);
   if (this->value_var_ != NULL)
     this->value_var_->determine_type_no_context(gogo);
-  this->range_->determine_type_no_context(gogo);
+
+  // `for u uint8 = range 10` types the untyped constant as uint8.
+  // A variable declared by := has already typed this expression.
+  Type* guessed = NULL;
+  bool untyped_integer = (this->range_->is_untyped(&guessed)
+			  && guessed != NULL
+			  && guessed->integer_type() != NULL);
+  Type_context context;
+  if (untyped_integer
+      && this->index_var_ != NULL
+      && !this->index_var_->is_sink_expression())
+    {
+      Type* lt = this->index_var_->type();
+      if (lt != NULL && !lt->is_abstract() && lt->integer_type() != NULL
+	  && !lt->is_error_type() && !lt->is_sink_type())
+	context.type = lt;
+    }
+  this->range_->determine_type(gogo, &context);
   this->statements_->determine_types(gogo);
 }
 
 void
 For_range_statement::do_check_types(Gogo*)
 {
+  if (this->range_->is_error_expression())
+    {
+      this->set_is_error();
+      return;
+    }
+
   Type* range_type = this->range_->type();
+  if (range_type->is_error_type())
+    {
+      this->set_is_error();
+      return;
+    }
 
   Type* index_type;
   Type* value_type = NULL;
@@ -6881,10 +7124,26 @@ For_range_statement::do_check_types(Gogo*)
 	  return;
 	}
     }
+  else if (range_type->integer_type() != NULL)
+    {
+      if (this->value_var_ != NULL
+	  && !this->value_var_->is_sink_expression())
+	{
+	  if (!this->value_var_->type()->is_error())
+	    this->report_error(_("too many variables for range clause "
+				 "with integer"));
+	  this->set_is_error();
+	  return;
+	}
+      index_type = integer_iteration_type(range_type, this->index_var_);
+      // A constant that does not fit the iteration type is rejected
+      // when the constant expression itself is checked.
+    }
   else
     {
       this->report_error(_("range clause must have "
-			   "array, slice, string, map, or channel type"));
+			   "array, slice, string, map, channel, or "
+			   "integer type"));
       return;
     }
 
@@ -6894,6 +7153,7 @@ For_range_statement::do_check_types(Gogo*)
 						       this->location()))
     this->set_is_error();
   if (this->value_var_ != NULL
+      && !this->value_var_->is_sink_expression()
       && !Assignment_statement::check_assignment_types(this->value_var_,
 						       value_type,
 						       this->location()))
@@ -6908,7 +7168,8 @@ Statement*
 For_range_statement::do_lower(Gogo* gogo, Named_object*, Block* enclosing,
 			      Statement_inserter*)
 {
-  if (this->classification() == STATEMENT_ERROR)
+  if (this->classification() == STATEMENT_ERROR
+      || this->range_->is_error_expression())
     return Statement::make_error_statement(this->location());
 
   Type* range_type = this->range_->type();
@@ -6938,6 +7199,13 @@ For_range_statement::do_lower(Gogo* gogo, Named_object*, Block* enclosing,
     {
       index_type = range_type->channel_type()->element_type();
       go_assert(this->value_var_ == NULL);
+    }
+  else if (range_type->integer_type() != NULL)
+    {
+      index_type = integer_iteration_type(range_type, this->index_var_);
+      go_assert(index_type != NULL);
+      go_assert(this->value_var_ == NULL
+		|| this->value_var_->is_sink_expression());
     }
   else
     go_unreachable();
@@ -7057,6 +7325,12 @@ For_range_statement::do_lower(Gogo* gogo, Named_object*, Block* enclosing,
     this->lower_range_channel(gogo, temp_block, body, range_object, range_temp,
 			      index_temp, value_temp, &init, &cond, &iter_init,
 			      &post);
+  else if (range_type->integer_type() != NULL)
+    {
+      this->lower_range_integer(gogo, temp_block, index_type, range_object,
+				range_temp, index_temp, &init, &cond, &post);
+      iter_init = NULL;
+    }
   else
     go_unreachable();
 
@@ -7085,6 +7359,12 @@ For_range_statement::do_lower(Gogo* gogo, Named_object*, Block* enclosing,
       assign->determine_types(gogo);
       body->add_statement(assign);
     }
+
+  // The per-iteration copy runs after the index and value are stored,
+  // and the next iteration does not read it back.
+  Block* iter_decls = this->per_iteration_vars(gogo, body);
+  if (iter_decls != NULL)
+    body->add_statement(Statement::make_block_statement(iter_decls, loc));
 
   body->add_statement(Statement::make_block_statement(this->statements_, loc));
 
@@ -7678,6 +7958,95 @@ For_range_statement::lower_range_channel(Gogo* gogo,
   iter_init->add_statement(s);
 
   *piter_init = iter_init;
+}
+
+// Lower an integer range to a counted loop of the iteration type.
+// The loop is index = 0; index < n; index++.  When n <= 0 the
+// condition fails immediately.  The post statement does not run when
+// the condition is false, so an unsigned index never increments past
+// its maximum.
+
+void
+For_range_statement::lower_range_integer(Gogo* gogo,
+					Block* enclosing,
+					Type* iter_type,
+					Named_object* range_object,
+					Temporary_statement* range_temp,
+					Temporary_statement* index_temp,
+					Block** pinit,
+					Expression** pcond,
+					Block** ppost)
+{
+  Location loc = this->location();
+  Block* init = new Block(enclosing, loc);
+
+  Expression* ref = this->make_range_ref(range_object, range_temp, loc);
+  Expression* conv = Expression::make_cast(iter_type, ref, loc);
+  Temporary_statement* n_temp = Statement::make_temporary(iter_type, conv,
+							  loc);
+  n_temp->determine_types(gogo);
+  init->add_statement(n_temp);
+
+  Expression* zexpr = Expression::make_integer_ul(0, iter_type, loc);
+  Temporary_reference_expression* tref =
+    Expression::make_temporary_reference(index_temp, loc);
+  tref->set_is_lvalue();
+  Statement* s = Statement::make_assignment(tref, zexpr, loc);
+  s->determine_types(gogo);
+  init->add_statement(s);
+  *pinit = init;
+
+  Expression* iref = Expression::make_temporary_reference(index_temp, loc);
+  Expression* nref = Expression::make_temporary_reference(n_temp, loc);
+  *pcond = Expression::make_binary(OPERATOR_LT, iref, nref, loc);
+
+  Block* post = new Block(enclosing, loc);
+  tref = Expression::make_temporary_reference(index_temp, loc);
+  tref->set_is_lvalue();
+  s = Statement::make_inc_statement(tref);
+  s->determine_types(gogo);
+  post->add_statement(s);
+  *ppost = post;
+}
+
+// Each variable declared by := in this range clause gets its own
+// storage for this iteration.  The returned block runs after the
+// iteration values are assigned and before the body.
+
+Block*
+For_range_statement::per_iteration_vars(Gogo* gogo, Block* enclosing)
+{
+  std::vector<Named_object*> loop_vars;
+
+  Expression* vars[2] = { this->index_var_, this->value_var_ };
+  for (int i = 0; i < 2; ++i)
+    {
+      Expression* e = vars[i];
+      if (e == NULL || e->is_sink_expression())
+	continue;
+      Var_expression* ve = e->var_expression();
+      if (ve == NULL || !ve->named_object()->is_variable())
+	continue;
+      Variable* var = ve->named_object()->var_value();
+      bool declared = (i == 0
+		       ? var->is_type_from_range_index()
+		       : var->is_type_from_range_value());
+      if (!declared)
+	continue;
+      Type* type = var->type();
+      if (type == NULL || type->is_error_type())
+	continue;
+      loop_vars.push_back(ve->named_object());
+    }
+  if (loop_vars.empty() || this->statements_ == NULL)
+    return NULL;
+
+  Block* decls = new Block(enclosing, this->location());
+  if (install_per_iteration_vars(gogo, this->statements_, decls, NULL,
+				 &loop_vars)
+      == 0)
+    return NULL;
+  return decls;
 }
 
 // Match

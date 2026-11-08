@@ -1607,6 +1607,7 @@ Escape_analysis_assign::expression(Expression** pexpr)
                 break;
 
               case Builtin_call_expression::BUILTIN_CLOSE:
+              case Builtin_call_expression::BUILTIN_CLEAR:
               case Builtin_call_expression::BUILTIN_DELETE:
               case Builtin_call_expression::BUILTIN_PRINT:
               case Builtin_call_expression::BUILTIN_PRINTLN:
@@ -1619,6 +1620,8 @@ Escape_analysis_assign::expression(Expression** pexpr)
               case Builtin_call_expression::BUILTIN_ALIGNOF:
               case Builtin_call_expression::BUILTIN_OFFSETOF:
               case Builtin_call_expression::BUILTIN_SIZEOF:
+              case Builtin_call_expression::BUILTIN_MIN:
+              case Builtin_call_expression::BUILTIN_MAX:
                 // these do not escape.
                 break;
 
@@ -2451,6 +2454,8 @@ Escape_analysis_assign::assign(Node* dst, Node* src)
 
                   case Builtin_call_expression::BUILTIN_LEN:
                   case Builtin_call_expression::BUILTIN_CAP:
+                  case Builtin_call_expression::BUILTIN_MIN:
+                  case Builtin_call_expression::BUILTIN_MAX:
                   case Builtin_call_expression::BUILTIN_COMPLEX:
                   case Builtin_call_expression::BUILTIN_REAL:
                   case Builtin_call_expression::BUILTIN_IMAG:
@@ -2466,6 +2471,7 @@ Escape_analysis_assign::assign(Node* dst, Node* src)
                     break;
 
                   case Builtin_call_expression::BUILTIN_CLOSE:
+                  case Builtin_call_expression::BUILTIN_CLEAR:
                   case Builtin_call_expression::BUILTIN_DELETE:
                   case Builtin_call_expression::BUILTIN_PRINT:
                   case Builtin_call_expression::BUILTIN_PRINTLN:

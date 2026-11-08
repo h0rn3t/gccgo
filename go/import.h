@@ -308,6 +308,12 @@ class Import : public Import_expression
   Type*
   read_type();
 
+  // Read a type parameter list written by Export::write_type_parameters.
+  // Each parameter is a named type whose underlying type is a type
+  // parameter.  The constraint is stored on that type parameter.
+  Typed_identifier_list*
+  read_type_parameters();
+
   // Return the type for a type index.  INPUT_NAME and INPUT_OFFSET
   // are only for error reporting.  PARSED is set to whether we parsed
   // the type information for a new type.

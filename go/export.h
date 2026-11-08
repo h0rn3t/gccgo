@@ -17,6 +17,7 @@ class Import_init;
 class Named_object;
 class Bindings;
 class Type;
+class Typed_identifier_list;
 class Package;
 class Import_init_set;
 class Backend;
@@ -161,7 +162,8 @@ class Export : public String_dump
 		 const std::string& import_init_fn,
 		 const Import_init_set& imported_init_fns,
 		 const Bindings* bindings,
-                 Unordered_set(Named_object*)* marked_inline_functions);
+                 Unordered_set(Named_object*)* marked_inline_functions,
+		 const std::vector<Named_object*>* generics);
 
   // Record a type that is mentioned in export data. Return value is
   // TRUE for newly visited types, FALSE for types that have been seen
@@ -196,6 +198,12 @@ class Export : public String_dump
   // definitions.
   void
   write_type(const Type*);
+
+  // Write [P C, ...] for a generic type or function.  Each P is the
+  // type parameter and each C is its constraint.  Writes nothing when
+  // TYPE_PARAMETERS is NULL.
+  void
+  write_type_parameters(const Typed_identifier_list* type_parameters);
 
   // Write a type to an exported function body.
   void

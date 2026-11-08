@@ -12682,7 +12682,8 @@ Call_expression::do_lower(Gogo* gogo, Named_object*,
   Func_expression* fe = this->fn_->func_expression();
   if (fe != NULL
       && fe->named_object()->is_function_declaration()
-      && fe->named_object()->func_declaration_value()->has_imported_body())
+      && fe->named_object()->func_declaration_value()->has_imported_body()
+      && !fe->named_object()->func_declaration_value()->has_type_parameters())
     gogo->add_imported_inlinable_function(fe->named_object());
 
   return this;
@@ -13760,6 +13761,64 @@ Call_expression::do_determine_type(Gogo* gogo, const Type_context* context)
     }
 
   this->fn_->determine_type_no_context(gogo);
+
+  // A call of a generic function with no explicit type arguments.
+  // Infer from the argument types, then type-check the call against
+  // the instantiated function.  Arguments are first typed with an
+  // abstract context so an untyped constant is not locked to its
+  // default type before inference; the parameter context below locks
+  // it.
+  {
+    Named_object* fn_no = NULL;
+    if (this->fn_->func_expression() != NULL)
+      fn_no = this->fn_->func_expression()->named_object();
+    else if (this->fn_->unknown_expression() != NULL)
+      {
+	fn_no = this->fn_->unknown_expression()->named_object();
+	if (fn_no->is_unknown())
+	  {
+	    Named_object* real = fn_no->unknown_value()->real_named_object();
+	    if (real != NULL)
+	      fn_no = real;
+	  }
+      }
+    bool generic_fn = false;
+    if (fn_no != NULL)
+      {
+	fn_no = fn_no->resolve();
+	if (fn_no->is_function())
+	  generic_fn = fn_no->func_value()->has_type_parameters();
+	else if (fn_no->is_function_declaration())
+	  generic_fn = fn_no->func_declaration_value()->has_type_parameters();
+      }
+    if (generic_fn)
+      {
+	if (this->args_ != NULL)
+	  {
+	    Type_context abs(NULL, true);
+	    for (Expression_list::iterator pa = this->args_->begin();
+		 pa != this->args_->end();
+		 ++pa)
+	      (*pa)->determine_type(gogo, &abs);
+	  }
+	Named_object* inst = gogo->infer_and_instantiate(fn_no, this->args_,
+							this->location());
+	if (inst == NULL)
+	  {
+	    this->set_is_error();
+	    if (this->args_ != NULL)
+	      {
+		for (Expression_list::iterator pa = this->args_->begin();
+		     pa != this->args_->end();
+		     ++pa)
+		  (*pa)->determine_type_no_context(gogo);
+	      }
+	    return;
+	  }
+	this->fn_ = Expression::make_func_reference(inst, NULL,
+						    this->location());
+      }
+  }
 
   // Simplify a type conversion.
 
@@ -22032,4 +22091,328 @@ Numeric_constant::hash(unsigned int seed) const
     }
 
   return (static_cast<unsigned int>(val) + seed) * PRIME;
+}
+
+// A generic function applied to type arguments.  The operand is a
+// function reference or an unknown name.  Lowered to a reference to
+// the instantiated function once every type argument is concrete.
+
+class Instantiation_expression : public Parser_expression
+{
+ public:
+  Instantiation_expression(Expression* operand, const std::vector<Type*>& args,
+			   Location location)
+    : Parser_expression(EXPRESSION_INSTANTIATION, location),
+      operand_(operand), args_(args), lowered_(NULL)
+  { }
+
+  // Substitute ARGS when SUBST is not NULL.  Returns NULL when an
+  // argument still names a type parameter; the node is left in the
+  // template and rewritten when that template is cloned.  Does not
+  // cache that failure.
+  Expression*
+  resolve(Gogo* gogo, Generic_subst* subst);
+
+ protected:
+  int
+  do_traverse(Traverse*);
+
+  Type*
+  do_type();
+
+  void
+  do_determine_type(Gogo*, const Type_context*);
+
+  Expression*
+  do_lower(Gogo*, Named_object*, Statement_inserter*);
+
+  Expression*
+  do_copy();
+
+  void
+  do_dump_expression(Ast_dump_context*) const;
+
+ private:
+  Expression* operand_;
+  std::vector<Type*> args_;
+  Expression* lowered_;
+};
+
+Expression*
+Instantiation_expression::resolve(Gogo* gogo, Generic_subst* subst)
+{
+  if (this->is_error_expression())
+    return Expression::make_error(this->location());
+  if (this->lowered_ != NULL && subst == NULL)
+    return this->lowered_;
+
+  std::vector<Type*> args;
+  args.reserve(this->args_.size());
+  for (size_t i = 0; i < this->args_.size(); ++i)
+    {
+      Type* a = this->args_[i];
+      if (subst != NULL)
+	a = gogo->substitute_type(a, subst, this->location());
+      if (a == NULL || a->is_error_type())
+	{
+	  this->set_is_error();
+	  return Expression::make_error(this->location());
+	}
+      args.push_back(a);
+    }
+  for (size_t i = 0; i < args.size(); ++i)
+    if (gogo->type_depends_on_type_parameter(args[i]))
+      return NULL;
+
+  Expression* op = this->operand_;
+  Named_object* no = NULL;
+  if (op->func_expression() != NULL)
+    no = op->func_expression()->named_object();
+  else if (op->unknown_expression() != NULL)
+    {
+      no = op->unknown_expression()->named_object();
+      if (no->is_unknown())
+	{
+	  Named_object* real = no->unknown_value()->real_named_object();
+	  if (real != NULL)
+	    no = real;
+	}
+    }
+  if (no != NULL)
+    no = no->resolve();
+
+  bool generic = false;
+  if (no != NULL && no->is_function())
+    generic = no->func_value()->has_type_parameters();
+  else if (no != NULL && no->is_function_declaration())
+    generic = no->func_declaration_value()->has_type_parameters();
+  if (!generic)
+    {
+      go_error_at(this->location(), "cannot instantiate");
+      this->set_is_error();
+      return Expression::make_error(this->location());
+    }
+
+  Named_object* inst = gogo->instantiate_function(no, args, this->location());
+  if (inst == NULL)
+    {
+      this->set_is_error();
+      return Expression::make_error(this->location());
+    }
+  return Expression::make_func_reference(inst, NULL, this->location());
+}
+
+int
+Instantiation_expression::do_traverse(Traverse* traverse)
+{
+  if (this->lowered_ != NULL)
+    return Expression::traverse(&this->lowered_, traverse);
+  return Expression::traverse(&this->operand_, traverse);
+}
+
+Type*
+Instantiation_expression::do_type()
+{
+  if (this->is_error_expression())
+    return Type::make_error_type();
+  go_assert(this->lowered_ != NULL);
+  return this->lowered_->type();
+}
+
+void
+Instantiation_expression::do_determine_type(Gogo* gogo,
+					    const Type_context* context)
+{
+  if (this->is_error_expression())
+    return;
+  if (this->lowered_ == NULL)
+    {
+      Expression* r = this->resolve(gogo, NULL);
+      if (r == NULL)
+	{
+	  go_error_at(this->location(),
+		      "cannot instantiate generic function here");
+	  this->set_is_error();
+	  return;
+	}
+      this->lowered_ = r;
+    }
+  this->lowered_->determine_type(gogo, context);
+}
+
+Expression*
+Instantiation_expression::do_lower(Gogo* gogo, Named_object*,
+				   Statement_inserter*)
+{
+  if (this->lowered_ == NULL)
+    {
+      Expression* r = this->resolve(gogo, NULL);
+      if (r == NULL)
+	{
+	  go_error_at(this->location(),
+		      "cannot instantiate generic function here");
+	  this->set_is_error();
+	  r = Expression::make_error(this->location());
+	}
+      this->lowered_ = r;
+    }
+  return this->lowered_;
+}
+
+Expression*
+Instantiation_expression::do_copy()
+{
+  return new Instantiation_expression(this->operand_->copy(), this->args_,
+				      this->location());
+}
+
+void
+Instantiation_expression::do_dump_expression(
+    Ast_dump_context* ast_dump_context) const
+{
+  ast_dump_context->ostream() << "instantiate(";
+  ast_dump_context->dump_expression(this->operand_);
+  ast_dump_context->ostream() << ")";
+}
+
+Expression*
+Expression::make_instantiation(Expression* operand,
+			       const std::vector<Type*>& args,
+			       Location location)
+{
+  return new Instantiation_expression(operand, args, location);
+}
+
+// Rewrite type parameters and cloned variables in one expression tree.
+// Replacing a shared var or type node returns SKIP so the template's
+// node is not walked.  A composite literal or conversion is a copy;
+// set_type mutates that copy and its children are still walked.
+
+class Apply_generic_subst : public Traverse
+{
+ public:
+  Apply_generic_subst(Gogo* gogo, Generic_subst* subst)
+    : Traverse(traverse_expressions),
+      gogo_(gogo), subst_(subst)
+  { }
+
+  int
+  expression(Expression**);
+
+ private:
+  Gogo* gogo_;
+  Generic_subst* subst_;
+};
+
+int
+Apply_generic_subst::expression(Expression** pexpr)
+{
+  Expression* e = *pexpr;
+  if (e->is_error_expression())
+    return TRAVERSE_CONTINUE;
+
+  Var_expression* ve = e->var_expression();
+  if (ve != NULL)
+    {
+      Named_object* to = this->subst_->var_for(ve->named_object());
+      if (to == NULL)
+	return TRAVERSE_SKIP_COMPONENTS;
+      if (to->is_variable())
+	to->var_value()->set_is_used();
+      *pexpr = Expression::make_var_reference(to, e->location());
+      return TRAVERSE_SKIP_COMPONENTS;
+    }
+
+  // Classification, not is_type_expression: an unresolved name that
+  // later denotes a type has no lowered expression yet, and type()
+  // would assert.
+  if (e->classification() == Expression::EXPRESSION_TYPE)
+    {
+      Type* nt = this->gogo_->substitute_type(e->type(), this->subst_,
+					      e->location());
+      *pexpr = Expression::make_type(nt, e->location());
+      return TRAVERSE_SKIP_COMPONENTS;
+    }
+
+  Type_conversion_expression* conv = e->conversion_expression();
+  if (conv != NULL)
+    {
+      conv->set_type(this->gogo_->substitute_type(conv->type(), this->subst_,
+						  e->location()));
+      return TRAVERSE_CONTINUE;
+    }
+
+  Composite_literal_expression* cl = e->composite_literal_expression();
+  if (cl != NULL)
+    {
+      cl->set_type(this->gogo_->substitute_type(cl->type(), this->subst_,
+						e->location()));
+      return TRAVERSE_CONTINUE;
+    }
+
+  if (e->classification() == Expression::EXPRESSION_INSTANTIATION)
+    {
+      Instantiation_expression* inst =
+	static_cast<Instantiation_expression*>(e);
+      Expression* r = inst->resolve(this->gogo_, this->subst_);
+      if (r != NULL)
+	{
+	  *pexpr = r;
+	  return TRAVERSE_SKIP_COMPONENTS;
+	}
+      return TRAVERSE_CONTINUE;
+    }
+
+  return TRAVERSE_CONTINUE;
+}
+
+void
+Expression::apply_generic_subst(Expression** pexpr, Gogo* gogo,
+				Generic_subst* subst)
+{
+  if (pexpr == NULL || *pexpr == NULL || subst == NULL)
+    return;
+  Apply_generic_subst apply(gogo, subst);
+  Expression::traverse(pexpr, &apply);
+}
+
+// Replace an instantiation whose type arguments are already concrete.
+// One that still names a type parameter belongs to a template and is
+// left for the clone.
+
+class Resolve_instantiations : public Traverse
+{
+ public:
+  Resolve_instantiations(Gogo* gogo)
+    : Traverse(traverse_expressions),
+      gogo_(gogo)
+  { }
+
+  int
+  expression(Expression**);
+
+ private:
+  Gogo* gogo_;
+};
+
+int
+Resolve_instantiations::expression(Expression** pexpr)
+{
+  Expression* e = *pexpr;
+  if (e->classification() != Expression::EXPRESSION_INSTANTIATION)
+    return TRAVERSE_CONTINUE;
+  Instantiation_expression* inst =
+    static_cast<Instantiation_expression*>(e);
+  Expression* r = inst->resolve(this->gogo_, NULL);
+  if (r == NULL)
+    return TRAVERSE_CONTINUE;
+  *pexpr = r;
+  return TRAVERSE_SKIP_COMPONENTS;
+}
+
+void
+Expression::resolve_instantiations(Gogo* gogo)
+{
+  Resolve_instantiations resolve(gogo);
+  gogo->traverse(&resolve);
 }

@@ -73,7 +73,11 @@ Gogo::Gogo(Backend* backend, Linemap* linemap, int, int pointer_size)
     gc_roots_(),
     type_descriptors_(),
     imported_inlinable_functions_(),
-    imported_inline_functions_()
+    imported_inline_functions_(),
+    generic_type_uses_(),
+    generic_func_uses_(),
+    instantiation_count_(0),
+    generics_to_export_()
 {
   const Location loc = Linemap::predeclared_location();
 
@@ -2122,6 +2126,29 @@ Gogo::start_function(const std::string& name, Function_type* type,
 
 	  if (rtype->is_error_type())
 	    ret = Named_object::make_function(name, NULL, function);
+	  else if (this->type_use_index(rtype) >= 0)
+	    {
+	      // func (b Box[T]) M() belongs to Box, not to the
+	      // placeholder Box[T].  The placeholder is substituted
+	      // away when Box is instantiated.
+	      int inst = this->type_use_index(rtype);
+	      Named_object* generic = this->generic_type_uses_[inst].generic;
+	      if (generic != NULL)
+		generic = generic->resolve();
+	      if (generic != NULL && generic->is_type()
+		  && generic->type_value()->named_object()->package() == NULL)
+		{
+		  ret = generic->type_value()->add_method(name, function);
+		  if (!ret->is_function())
+		    ret = Named_object::make_function(name, NULL, function);
+		}
+	      else
+		{
+		  go_error_at(type->receiver()->location(),
+			      "may not define methods on non-local type");
+		  ret = Named_object::make_function(name, NULL, function);
+		}
+	    }
 	  else if (rtype->named_type() != NULL)
 	    {
 	      if (rtype->named_type()->named_object()->package() != NULL)
@@ -5305,7 +5332,8 @@ Gogo::do_exports()
 		     init_fn_name,
 		     this->imported_init_fns_,
 		     this->package_->bindings(),
-                     &marked_functions);
+                     &marked_functions,
+		     &this->generics_to_export_);
 
   if (!this->c_header_.empty() && !saw_errors())
     this->write_c_header();
@@ -5519,9 +5547,10 @@ Gogo::convert_named_types()
 }
 
 // Remove uninstantiated generic declarations from the definition list.
-// Type checking has already walked them.  The names remain visible so
-// a later reference can still say the type or function was not
-// instantiated, instead of reporting it as undefined.
+// Call this after instantiating uses in this package and before type
+// checking, so a template body is not type-checked in place.  The
+// names remain visible so a later reference can still say the type or
+// function was not instantiated, instead of reporting it as undefined.
 
 void
 Gogo::hide_uninstantiated_generics()
@@ -5541,7 +5570,1619 @@ Gogo::hide_uninstantiated_generics()
 	drop.push_back(no);
     }
   for (size_t i = 0; i < drop.size(); ++i)
-    bindings->remove_definition(drop[i]);
+    {
+      Named_object* no = drop[i];
+      // Exported templates are written later.  They are not in the
+      // definition list, so the passes before do_exports skip them.
+      // A method is written with its type, not as its own export.
+      bool is_method = (no->is_function()
+			&& no->func_value()->type()->is_method());
+      if (!is_method
+	  && no->package() == NULL
+	  && !Gogo::is_hidden_name(no->name()))
+	this->generics_to_export_.push_back(no);
+      bindings->remove_definition(no);
+    }
+}
+
+// Two type arguments name the same type.  Distinct forward
+// declarations of one name (each parse of "int" before it is known)
+// are the same argument.  An undefined forward does not match a
+// different type.
+
+bool
+Gogo::same_type(Type* a, Type* b) const
+{
+  if (a == b)
+    return true;
+  if (a == NULL || b == NULL)
+    return false;
+  if (a->is_error_type() || b->is_error_type())
+    return a->is_error_type() && b->is_error_type();
+
+  Type* af = a->forwarded();
+  Type* bf = b->forwarded();
+  if (af == bf)
+    return true;
+
+  Forward_declaration_type* afd = af->forward_declaration_type();
+  Forward_declaration_type* bfd = bf->forward_declaration_type();
+  if (afd != NULL && bfd != NULL)
+    return afd->named_object() == bfd->named_object();
+  if (afd != NULL || bfd != NULL)
+    return false;
+  return Type::are_identical(af, bf, Type::COMPARE_TAGS, NULL);
+}
+
+bool
+Gogo::same_arg_list(const std::vector<Type*>& a,
+		    const std::vector<Type*>& b) const
+{
+  if (a.size() != b.size())
+    return false;
+  for (size_t i = 0; i < a.size(); ++i)
+    if (!this->same_type(a[i], b[i]))
+      return false;
+  return true;
+}
+
+// The named object a type instantiation is applied to.  Unknown names
+// are followed when they already have a real object.
+
+Named_object*
+Gogo::generic_type_object(Type* base) const
+{
+  if (base == NULL || base->is_error_type())
+    return NULL;
+  Type* t = base->forwarded();
+  if (t->is_error_type())
+    return NULL;
+  if (t->forward_declaration_type() != NULL)
+    return t->forward_declaration_type()->named_object();
+  if (t->named_type() != NULL)
+    return t->named_type()->named_object();
+  return NULL;
+}
+
+const Typed_identifier_list*
+Gogo::generic_type_params(Named_object* no) const
+{
+  if (no == NULL)
+    return NULL;
+  no = no->resolve();
+  if (no->is_type())
+    return no->type_value()->type_parameters();
+  if (no->is_type_declaration())
+    return no->type_declaration_value()->type_parameters();
+  return NULL;
+}
+
+int
+Gogo::find_type_use(Named_object* generic,
+		    const std::vector<Type*>& args) const
+{
+  if (generic == NULL)
+    return -1;
+  generic = generic->resolve();
+  for (size_t i = 0; i < this->generic_type_uses_.size(); ++i)
+    {
+      Named_object* g = this->generic_type_uses_[i].generic;
+      if (g != NULL)
+	g = g->resolve();
+      if (g == generic
+	  && this->same_arg_list(this->generic_type_uses_[i].args, args))
+	return static_cast<int>(i);
+    }
+  return -1;
+}
+
+int
+Gogo::type_use_index(Type* type) const
+{
+  if (type == NULL || type->is_error_type())
+    return -1;
+  Type* t = type->forwarded();
+  Named_object* obj = NULL;
+  if (t->forward_declaration_type() != NULL)
+    obj = t->forward_declaration_type()->named_object();
+  else if (t->named_type() != NULL)
+    obj = t->named_type()->named_object();
+  else
+    return -1;
+  for (size_t i = 0; i < this->generic_type_uses_.size(); ++i)
+    if (this->generic_type_uses_[i].object == obj)
+      return static_cast<int>(i);
+  return -1;
+}
+
+int
+Gogo::find_func_use(Named_object* generic,
+		    const std::vector<Type*>& args) const
+{
+  if (generic == NULL)
+    return -1;
+  generic = generic->resolve();
+  for (size_t i = 0; i < this->generic_func_uses_.size(); ++i)
+    {
+      Named_object* g = this->generic_func_uses_[i].generic;
+      if (g != NULL)
+	g = g->resolve();
+      if (g == generic
+	  && this->same_arg_list(this->generic_func_uses_[i].args, args))
+	return static_cast<int>(i);
+    }
+  return -1;
+}
+
+// A hidden name for one instantiation.  The leading dot marks it
+// hidden; do not pass the result through pack_hidden_name.
+
+std::string
+Gogo::instantiation_name(const std::string& base_name)
+{
+  char buf[32];
+  snprintf(buf, sizeof buf, "%u", this->instantiation_count_);
+  ++this->instantiation_count_;
+  std::string ret = ".";
+  ret += this->pkgpath();
+  ret += ".inst.";
+  ret += base_name;
+  ret += ".";
+  ret += buf;
+  return ret;
+}
+
+// Record BASE[ARGS] and return one shared forward declaration.
+// Nothing is instantiated here: the arguments may still name a type
+// parameter.  Defining the forward later makes every existing pointer
+// see the instance.
+
+Type*
+Gogo::make_instantiation_type(Type* base, const std::vector<Type*>& args,
+			      Location location)
+{
+  for (size_t i = 0; i < args.size(); ++i)
+    if (args[i] == NULL || args[i]->is_error_type())
+      return Type::make_error_type();
+
+  Named_object* generic = this->generic_type_object(base);
+  if (generic == NULL)
+    {
+      go_error_at(location, "cannot instantiate");
+      return Type::make_error_type();
+    }
+  generic = generic->resolve();
+
+  if (generic->is_type() && !generic->type_value()->has_type_parameters())
+    {
+      go_error_at(location, "cannot instantiate %qs",
+		  generic->message_name().c_str());
+      return Type::make_error_type();
+    }
+  if (generic->is_function() || generic->is_function_declaration()
+      || generic->is_const() || generic->is_variable())
+    {
+      go_error_at(location, "cannot instantiate %qs",
+		  generic->message_name().c_str());
+      return Type::make_error_type();
+    }
+
+  const Typed_identifier_list* tparams = this->generic_type_params(generic);
+  if (tparams != NULL && tparams->size() != args.size())
+    {
+      go_error_at(location, "got %d type arguments, want %d",
+		  static_cast<int>(args.size()),
+		  static_cast<int>(tparams->size()));
+      return Type::make_error_type();
+    }
+
+  int existing = this->find_type_use(generic, args);
+  if (existing >= 0)
+    return this->generic_type_uses_[existing].type;
+
+  std::string name =
+    this->instantiation_name(Gogo::unpack_hidden_name(generic->name()));
+  Named_object* obj =
+    this->package_->bindings()->add_type_declaration(name, NULL, location);
+  Type* fwd = Type::make_forward_declaration(obj);
+
+  Generic_type_use use;
+  use.object = obj;
+  use.generic = generic;
+  use.args = args;
+  use.type = fwd;
+  use.location = location;
+  use.building = false;
+  use.defined = false;
+  this->generic_type_uses_.push_back(use);
+  return fwd;
+}
+
+// Whether TYPE still mentions a type parameter.  A placeholder whose
+// arguments are all concrete does not: the fixpoint will define it.
+// SEEN is a stack of types currently being expanded, not a permanent
+// set, so a repeated *T is examined twice.
+
+bool
+Gogo::depends_on_type_parameter(Type* type,
+				std::vector<const Type*>* seen) const
+{
+  if (type == NULL || type->is_error_type())
+    return false;
+  Type* t = type->forwarded();
+  for (size_t i = 0; i < seen->size(); ++i)
+    if ((*seen)[i] == t)
+      return false;
+  seen->push_back(t);
+
+  bool ret = false;
+  Named_type* nt = t->named_type();
+  if (nt != NULL)
+    {
+      Type* under = nt->real_type()->forwarded();
+      ret = under->classification() == Type::TYPE_TYPE_PARAMETER;
+    }
+  else
+    {
+      int idx = this->type_use_index(t);
+      if (idx >= 0)
+	{
+	  const std::vector<Type*>& args = this->generic_type_uses_[idx].args;
+	  for (size_t i = 0; i < args.size(); ++i)
+	    if (this->depends_on_type_parameter(args[i], seen))
+	      {
+		ret = true;
+		break;
+	      }
+	}
+      else
+	{
+	  switch (t->classification())
+	    {
+	    case Type::TYPE_POINTER:
+	      ret = this->depends_on_type_parameter(t->points_to(), seen);
+	      break;
+	    case Type::TYPE_ARRAY:
+	      ret = this->depends_on_type_parameter(
+		t->array_type()->element_type(), seen);
+	      break;
+	    case Type::TYPE_MAP:
+	      ret = (this->depends_on_type_parameter(
+		       t->map_type()->key_type(), seen)
+		     || this->depends_on_type_parameter(
+			  t->map_type()->val_type(), seen));
+	      break;
+	    case Type::TYPE_CHANNEL:
+	      if (t->channel_type()->element_type() != NULL)
+		ret = this->depends_on_type_parameter(
+		  t->channel_type()->element_type(), seen);
+	      break;
+	    case Type::TYPE_FUNCTION:
+	      {
+		Function_type* ft = t->function_type();
+		if (ft->receiver() != NULL)
+		  ret = this->depends_on_type_parameter(
+		    ft->receiver()->type(), seen);
+		const Typed_identifier_list* params = ft->parameters();
+		if (!ret && params != NULL)
+		  for (size_t i = 0; i < params->size(); ++i)
+		    if (this->depends_on_type_parameter(params->at(i).type(),
+						       seen))
+		      {
+			ret = true;
+			break;
+		      }
+		const Typed_identifier_list* results = ft->results();
+		if (!ret && results != NULL)
+		  for (size_t i = 0; i < results->size(); ++i)
+		    if (this->depends_on_type_parameter(results->at(i).type(),
+						       seen))
+		      {
+			ret = true;
+			break;
+		      }
+	      }
+	      break;
+	    case Type::TYPE_STRUCT:
+	      {
+		const Struct_field_list* fields = t->struct_type()->fields();
+		if (fields != NULL)
+		  for (size_t i = 0; i < fields->size(); ++i)
+		    if (this->depends_on_type_parameter(fields->at(i).type(),
+						       seen))
+		      {
+			ret = true;
+			break;
+		      }
+	      }
+	      break;
+	    case Type::TYPE_INTERFACE:
+	      {
+		const Typed_identifier_list* methods =
+		  t->interface_type()->local_methods();
+		if (methods != NULL)
+		  for (size_t i = 0; i < methods->size(); ++i)
+		    if (this->depends_on_type_parameter(methods->at(i).type(),
+						       seen))
+		      {
+			ret = true;
+			break;
+		      }
+	      }
+	      break;
+	    default:
+	      break;
+	    }
+	}
+    }
+
+  seen->pop_back();
+  return ret;
+}
+
+bool
+Gogo::type_depends_on_type_parameter(Type* t) const
+{
+  std::vector<const Type*> seen;
+  return this->depends_on_type_parameter(t, &seen);
+}
+
+// Substitute type parameters.  A named type that is not itself a type
+// parameter is returned unchanged.  On reentry of the type currently
+// being expanded, return it: a Go type is not pointer-recursive
+// except through a named type or a placeholder.
+
+Type*
+Gogo::substitute_type(Type* type, Generic_subst* subst, Location location)
+{
+  std::vector<const Type*> seen;
+  return this->substitute_type(type, subst, location, &seen);
+}
+
+Type*
+Gogo::substitute_type(Type* type, Generic_subst* subst, Location location,
+		      std::vector<const Type*>* seen)
+{
+  if (type == NULL || subst == NULL || type->is_error_type())
+    return type;
+
+  Type* t = type->forwarded();
+  for (size_t i = 0; i < seen->size(); ++i)
+    if ((*seen)[i] == t)
+      return t;
+  seen->push_back(t);
+
+  Named_type* nt = t->named_type();
+  if (nt != NULL)
+    {
+      Type* under = nt->real_type()->forwarded();
+      if (under->classification() == Type::TYPE_TYPE_PARAMETER)
+	{
+	  Type* arg = subst->type_for(nt);
+	  seen->pop_back();
+	  if (arg == NULL)
+	    {
+	      go_error_at(location, "unbound type parameter %qs",
+			  nt->named_object()->message_name().c_str());
+	      return Type::make_error_type();
+	    }
+	  if (arg == t)
+	    return arg;
+	  return this->substitute_type(arg, subst, location, seen);
+	}
+      seen->pop_back();
+      return t;
+    }
+
+  int idx = this->type_use_index(t);
+  if (idx >= 0)
+    {
+      // Copy the argument count first.  Substituting an argument can
+      // push another use and reallocate the vector.
+      size_t nargs = this->generic_type_uses_[idx].args.size();
+      std::vector<Type*> new_args;
+      new_args.reserve(nargs);
+      bool changed = false;
+      bool depends = false;
+      for (size_t i = 0; i < nargs; ++i)
+	{
+	  Type* oa = this->generic_type_uses_[idx].args[i];
+	  Type* na = this->substitute_type(oa, subst, location, seen);
+	  if (na != oa)
+	    changed = true;
+	  std::vector<const Type*> dep_seen;
+	  if (this->depends_on_type_parameter(na, &dep_seen))
+	    depends = true;
+	  new_args.push_back(na);
+	}
+
+      Named_object* generic = this->generic_type_uses_[idx].generic;
+      Type* placeholder = this->generic_type_uses_[idx].type;
+      seen->pop_back();
+
+      if (depends && !changed)
+	return placeholder;
+      if (changed)
+	{
+	  Type* neu = this->make_instantiation_type(generic, new_args,
+						    location);
+	  if (depends || neu->is_error_type())
+	    return neu;
+	  int nidx = this->type_use_index(neu);
+	  if (nidx < 0)
+	    return neu;
+	  return this->define_type_instance(static_cast<size_t>(nidx));
+	}
+      return this->define_type_instance(static_cast<size_t>(idx));
+    }
+
+  Type* ret = t;
+  switch (t->classification())
+    {
+    case Type::TYPE_POINTER:
+      {
+	Type* to = t->points_to();
+	Type* nto = this->substitute_type(to, subst, location, seen);
+	if (nto != to)
+	  ret = Type::make_pointer_type(nto);
+      }
+      break;
+
+    case Type::TYPE_ARRAY:
+      {
+	Array_type* at = t->array_type();
+	Type* elem = at->element_type();
+	Type* nelem = this->substitute_type(elem, subst, location, seen);
+	Expression* len = at->length();
+	Expression* nlen = len;
+	if (len != NULL)
+	  {
+	    nlen = len->copy();
+	    Expression::apply_generic_subst(&nlen, this, subst);
+	  }
+	if (nelem != elem || nlen != len)
+	  ret = Type::make_array_type(nelem, nlen);
+      }
+      break;
+
+    case Type::TYPE_MAP:
+      {
+	Map_type* mt = t->map_type();
+	Type* k = this->substitute_type(mt->key_type(), subst, location, seen);
+	Type* v = this->substitute_type(mt->val_type(), subst, location, seen);
+	if (k != mt->key_type() || v != mt->val_type())
+	  ret = Type::make_map_type(k, v, location);
+      }
+      break;
+
+    case Type::TYPE_CHANNEL:
+      {
+	Channel_type* ct = t->channel_type();
+	Type* elem = ct->element_type();
+	Type* nelem = elem;
+	if (elem != NULL)
+	  nelem = this->substitute_type(elem, subst, location, seen);
+	if (nelem != elem)
+	  ret = Type::make_channel_type(ct->may_send(), ct->may_receive(),
+					nelem);
+      }
+      break;
+
+    case Type::TYPE_FUNCTION:
+      {
+	Function_type* ft = t->function_type();
+	bool changed = false;
+	Typed_identifier* recv = NULL;
+	if (ft->receiver() != NULL)
+	  {
+	    Type* rt = this->substitute_type(ft->receiver()->type(), subst,
+					     location, seen);
+	    if (rt != ft->receiver()->type())
+	      changed = true;
+	    recv = new Typed_identifier(ft->receiver()->name(), rt,
+					ft->receiver()->location());
+	  }
+
+	Typed_identifier_list* params = NULL;
+	if (ft->parameters() != NULL)
+	  {
+	    params = new Typed_identifier_list();
+	    for (size_t i = 0; i < ft->parameters()->size(); ++i)
+	      {
+		const Typed_identifier& id = ft->parameters()->at(i);
+		Type* nt = this->substitute_type(id.type(), subst, location,
+						 seen);
+		if (nt != id.type())
+		  changed = true;
+		params->push_back(Typed_identifier(id.name(), nt,
+						   id.location()));
+	      }
+	  }
+
+	Typed_identifier_list* results = NULL;
+	if (ft->results() != NULL)
+	  {
+	    results = new Typed_identifier_list();
+	    for (size_t i = 0; i < ft->results()->size(); ++i)
+	      {
+		const Typed_identifier& id = ft->results()->at(i);
+		Type* nt = this->substitute_type(id.type(), subst, location,
+						 seen);
+		if (nt != id.type())
+		  changed = true;
+		results->push_back(Typed_identifier(id.name(), nt,
+						    id.location()));
+	      }
+	  }
+
+	if (!changed)
+	  {
+	    delete recv;
+	    delete params;
+	    delete results;
+	  }
+	else
+	  {
+	    Function_type* nft = Type::make_function_type(recv, params, results,
+							  ft->location());
+	    if (ft->is_varargs())
+	      nft->set_is_varargs();
+	    if (ft->is_builtin())
+	      nft->set_is_builtin();
+	    ret = nft;
+	  }
+      }
+      break;
+
+    case Type::TYPE_STRUCT:
+      {
+	const Struct_field_list* old = t->struct_type()->fields();
+	bool changed = false;
+	std::vector<Type*> field_types;
+	if (old != NULL)
+	  {
+	    field_types.reserve(old->size());
+	    for (size_t i = 0; i < old->size(); ++i)
+	      {
+		Type* nt = this->substitute_type(old->at(i).type(), subst,
+						 location, seen);
+		if (nt != old->at(i).type())
+		  changed = true;
+		field_types.push_back(nt);
+	      }
+	  }
+	if (changed)
+	  {
+	    Struct_field_list* fields = new Struct_field_list();
+	    for (size_t i = 0; i < old->size(); ++i)
+	      {
+		const Struct_field& f = old->at(i);
+		std::string name = f.is_anonymous() ? std::string()
+						    : f.field_name();
+		Struct_field sf(Typed_identifier(name, field_types[i],
+						 f.location()));
+		if (f.has_tag())
+		  sf.set_tag(f.tag());
+		fields->push_back(sf);
+	      }
+	    ret = Type::make_struct_type(fields, t->struct_type()->location());
+	  }
+      }
+      break;
+
+    case Type::TYPE_INTERFACE:
+      {
+	const Typed_identifier_list* methods =
+	  t->interface_type()->local_methods();
+	if (methods != NULL)
+	  {
+	    Typed_identifier_list* neu = new Typed_identifier_list();
+	    bool changed = false;
+	    for (size_t i = 0; i < methods->size(); ++i)
+	      {
+		const Typed_identifier& id = methods->at(i);
+		Type* nt = this->substitute_type(id.type(), subst, location,
+						 seen);
+		if (nt != id.type())
+		  changed = true;
+		neu->push_back(Typed_identifier(id.name(), nt, id.location()));
+	      }
+	    if (!changed)
+	      delete neu;
+	    else
+	      ret = Type::make_interface_type(neu,
+					      t->interface_type()->location());
+	  }
+      }
+      break;
+
+    default:
+      break;
+    }
+
+  seen->pop_back();
+  return ret;
+}
+
+// Define every recorded type instance whose arguments are concrete.
+// Nested definitions happen inside substitute_type.  An instance that
+// failed is defined as an error type so this does not retry it.
+
+void
+Gogo::define_ready_type_instances()
+{
+  bool progress = true;
+  while (progress)
+    {
+      progress = false;
+      for (size_t i = 0; i < this->generic_type_uses_.size(); ++i)
+	{
+	  if (this->generic_type_uses_[i].defined
+	      || this->generic_type_uses_[i].building)
+	    continue;
+	  bool dep = false;
+	  size_t nargs = this->generic_type_uses_[i].args.size();
+	  for (size_t a = 0; a < nargs; ++a)
+	    {
+	      std::vector<const Type*> seen;
+	      if (this->depends_on_type_parameter(
+		    this->generic_type_uses_[i].args[a], &seen))
+		{
+		  dep = true;
+		  break;
+		}
+	    }
+	  if (dep)
+	    continue;
+	  this->define_type_instance(i);
+	  if (this->generic_type_uses_[i].defined)
+	    progress = true;
+	}
+    }
+}
+
+// Build the named type for generic_type_uses_[INDEX].  While the
+// underlying type is substituted, a recursive mention of this
+// instance returns the same forward.
+
+Type*
+Gogo::define_type_instance(size_t index)
+{
+  if (index >= this->generic_type_uses_.size())
+    return Type::make_error_type();
+  if (this->generic_type_uses_[index].defined)
+    return this->generic_type_uses_[index].object->type_value();
+  if (this->generic_type_uses_[index].building)
+    return this->generic_type_uses_[index].type;
+
+  size_t nargs = this->generic_type_uses_[index].args.size();
+  for (size_t i = 0; i < nargs; ++i)
+    {
+      std::vector<const Type*> seen;
+      if (this->depends_on_type_parameter(this->generic_type_uses_[index].args[i],
+					  &seen))
+	return this->generic_type_uses_[index].type;
+    }
+
+  this->generic_type_uses_[index].building = true;
+  Location loc = this->generic_type_uses_[index].location;
+  Named_object* generic = this->generic_type_uses_[index].generic->resolve();
+  this->generic_type_uses_[index].generic = generic;
+  std::vector<Type*> args = this->generic_type_uses_[index].args;
+
+  bool ok = true;
+  const Typed_identifier_list* tparams = this->generic_type_params(generic);
+  if (!generic->is_type() || tparams == NULL)
+    {
+      go_error_at(loc, "cannot instantiate");
+      ok = false;
+    }
+  else if (tparams->size() != args.size())
+    {
+      go_error_at(loc, "got %d type arguments, want %d",
+		  static_cast<int>(args.size()),
+		  static_cast<int>(tparams->size()));
+      ok = false;
+    }
+  else if (!this->check_type_arguments(generic, args, loc))
+    ok = false;
+
+  Type* under = Type::make_error_type();
+  if (ok)
+    {
+      Generic_subst subst;
+      for (size_t i = 0; i < tparams->size(); ++i)
+	{
+	  Named_type* pt = tparams->at(i).type()->named_type();
+	  go_assert(pt != NULL);
+	  subst.bind_type(pt, args[i]);
+	}
+      Type* raw = generic->type_value()->real_type();
+      std::vector<const Type*> seen;
+      under = this->substitute_type(raw, &subst, loc, &seen);
+      if (under == NULL)
+	under = Type::make_error_type();
+    }
+
+  Named_object* obj = this->generic_type_uses_[index].object;
+  Named_type* nt = Type::make_named_type(obj, under, loc);
+  this->package_->bindings()->define_type(obj, nt);
+  // Defined before methods are copied, so a receiver type Box[T]
+  // substitutes back to this instance instead of defining it again.
+  this->generic_type_uses_[index].defined = true;
+  this->generic_type_uses_[index].building = false;
+  if (ok)
+    this->copy_generic_methods(generic, nt, args, loc);
+  return nt;
+}
+
+// One concrete method for each method of the generic type.  The
+// method's own type parameters, declared by its receiver, are bound
+// positionally to ARGS.
+
+void
+Gogo::copy_generic_methods(Named_object* generic, Named_type* instance,
+			   const std::vector<Type*>& args, Location loc)
+{
+  if (generic == NULL || !generic->is_type() || instance == NULL)
+    return;
+  const Bindings* methods = generic->type_value()->local_methods();
+  if (methods == NULL)
+    return;
+
+  for (Bindings::const_definitions_iterator p = methods->begin_definitions();
+       p != methods->end_definitions();
+       ++p)
+    {
+      Named_object* mno = *p;
+      if (!mno->is_function())
+	continue;
+      Function* src = mno->func_value();
+      const Typed_identifier_list* mt = src->type_parameters();
+      if (mt == NULL)
+	continue;
+      if (mt->size() != args.size())
+	{
+	  go_error_at(mno->location(), "got %d type arguments, want %d",
+		      static_cast<int>(args.size()),
+		      static_cast<int>(mt->size()));
+	  continue;
+	}
+
+      Generic_subst subst;
+      bool bad = false;
+      for (size_t i = 0; i < mt->size(); ++i)
+	{
+	  Named_type* pt = mt->at(i).type()->named_type();
+	  if (pt == NULL)
+	    {
+	      bad = true;
+	      break;
+	    }
+	  subst.bind_type(pt, args[i]);
+	}
+      if (bad)
+	{
+	  go_error_at(mno->location(), "invalid type parameter");
+	  continue;
+	}
+
+      std::vector<const Type*> seen;
+      Type* st = this->substitute_type(src->type(), &subst, loc, &seen);
+      Function_type* nft = st == NULL ? NULL : st->function_type();
+      if (nft == NULL)
+	{
+	  go_error_at(mno->location(), "cannot instantiate");
+	  continue;
+	}
+
+      Location floc = src->location();
+      Block* block = new Block(NULL, floc);
+      Function* newf = new Function(nft, NULL, block, floc);
+      Named_object* instm = instance->add_method(mno->name(), newf);
+      if (!instm->is_function() || instm->func_value() != newf)
+	continue;
+      this->package_->bindings()->add_method(instm);
+      this->copy_parameters(src, block, &subst);
+      newf->create_result_variables(this);
+      this->bind_result_variables(src, block, &subst);
+      this->copy_block(src->block(), block, instm, &subst);
+    }
+
+  this->finalize_methods_for_type(instance);
+}
+
+// Report whether each type argument satisfies its constraint.
+// Constraints are interfaces in Go 1.18.  comparable is handled
+// before an empty interface would accept every type.  A constraint
+// that is still a type parameter after substitution is rejected.
+
+bool
+Gogo::check_type_arguments(Named_object* generic,
+			   const std::vector<Type*>& args, Location location)
+{
+  generic = generic->resolve();
+  const Typed_identifier_list* tparams = NULL;
+  if (generic->is_type() || generic->is_type_declaration())
+    tparams = this->generic_type_params(generic);
+  else if (generic->is_function())
+    tparams = generic->func_value()->type_parameters();
+  else if (generic->is_function_declaration())
+    tparams = generic->func_declaration_value()->type_parameters();
+  if (tparams == NULL || tparams->size() != args.size())
+    {
+      go_error_at(location, "wrong number of type arguments");
+      return false;
+    }
+
+  Generic_subst subst;
+  for (size_t i = 0; i < tparams->size(); ++i)
+    {
+      Named_type* nt = tparams->at(i).type()->named_type();
+      if (nt == NULL)
+	{
+	  go_error_at(location, "invalid type parameter");
+	  return false;
+	}
+      subst.bind_type(nt, args[i]);
+    }
+
+  for (size_t i = 0; i < tparams->size(); ++i)
+    {
+      Named_type* nt = tparams->at(i).type()->named_type();
+      Type* under = nt->real_type()->forwarded();
+      if (under->classification() != Type::TYPE_TYPE_PARAMETER)
+	{
+	  go_error_at(location, "invalid type parameter");
+	  return false;
+	}
+      Type* constraint = static_cast<Type_parameter*>(under)->constraint();
+      if (constraint == NULL)
+	{
+	  go_error_at(location, "invalid type constraint");
+	  return false;
+	}
+      std::vector<const Type*> seen;
+      Type* c = this->substitute_type(constraint, &subst, location, &seen);
+      if (!this->constraint_satisfied(c, args[i], location))
+	return false;
+    }
+  return true;
+}
+
+bool
+Gogo::constraint_satisfied(Type* constraint, Type* arg, Location location)
+{
+  if (constraint == NULL || constraint->is_error_type()
+      || arg == NULL || arg->is_error_type())
+    return true;
+
+  Named_type* nt = constraint->named_type();
+  if (nt != NULL && nt->is_builtin_comparable())
+    {
+      if (!arg->is_comparable())
+	{
+	  go_error_at(location, "type argument is not comparable");
+	  return false;
+	}
+      return true;
+    }
+
+  Type* u = constraint->unalias();
+  if (u->named_type() != NULL)
+    {
+      Type* under = u->named_type()->real_type()->forwarded();
+      if (under->classification() == Type::TYPE_TYPE_PARAMETER)
+	{
+	  go_error_at(location, "constraint too complex");
+	  return false;
+	}
+    }
+
+  Interface_type* it = u->interface_type();
+  if (it == NULL)
+    {
+      go_error_at(location, "invalid type constraint");
+      return false;
+    }
+  it->finalize_methods();
+  std::string reason;
+  if (!it->implements_interface(arg, &reason))
+    {
+      if (reason.empty())
+	go_error_at(location, "type argument does not implement constraint");
+      else
+	go_error_at(location,
+		    "type argument does not implement constraint (%s)",
+		    reason.c_str());
+      return false;
+    }
+  return true;
+}
+
+// Copy receiver and parameters into the instance, under the names
+// they already have in the template block.
+
+void
+Gogo::copy_parameters(Function* from, Block* to, Generic_subst* subst)
+{
+  Bindings* bindings = from->block()->bindings();
+  for (Bindings::const_definitions_iterator p = bindings->begin_definitions();
+       p != bindings->end_definitions();
+       ++p)
+    {
+      Named_object* no = *p;
+      if (!no->is_variable())
+	continue;
+      Variable* var = no->var_value();
+      if (!var->is_parameter())
+	continue;
+      if (var->has_pre_init())
+	go_error_at(var->location(),
+		    "statement in generic function is not supported yet");
+
+      Type* vt = var->type();
+      std::vector<const Type*> seen;
+      Type* nt = this->substitute_type(vt, subst, var->location(), &seen);
+      Variable* nv = new Variable(nt, NULL, false, true, var->is_receiver(),
+				  var->location());
+      if (var->is_varargs_parameter())
+	nv->set_is_varargs_parameter();
+      if (var->is_used())
+	nv->set_is_used();
+      if (var->is_address_taken())
+	nv->set_address_taken();
+      if (var->is_non_escaping_address_taken())
+	nv->set_non_escaping_address_taken();
+      Named_object* added = to->bindings()->add_variable(no->name(), NULL, nv);
+      subst->bind_var(no, added);
+    }
+}
+
+// Point the template's result variables at the ones
+// create_result_variables just built.  Unnamed results are given a
+// fresh $retN, so a reference to one is left unmapped.
+
+void
+Gogo::bind_result_variables(Function* from, Block* to, Generic_subst* subst)
+{
+  Function::Results* results = from->result_variables();
+  if (results == NULL)
+    return;
+  for (Function::Results::iterator p = results->begin();
+       p != results->end();
+       ++p)
+    {
+      Named_object* neu = to->bindings()->lookup_local((*p)->name());
+      if (neu != NULL)
+	subst->bind_var(*p, neu);
+    }
+}
+
+// Copy local variables.  Parameters and result variables are handled
+// by the caller.  The initializer is copied and substituted after
+// earlier locals have been bound.
+
+void
+Gogo::copy_locals(Block* from, Block* to, Generic_subst* subst)
+{
+  Bindings* bindings = from->bindings();
+  for (Bindings::const_definitions_iterator p = bindings->begin_definitions();
+       p != bindings->end_definitions();
+       ++p)
+    {
+      Named_object* no = *p;
+      if (no->is_result_variable())
+	continue;
+      if (no->is_variable())
+	{
+	  Variable* var = no->var_value();
+	  if (var->is_parameter())
+	    continue;
+	  if (var->has_pre_init())
+	    {
+	      go_error_at(var->location(),
+			  "statement in generic function is not supported yet");
+	      continue;
+	    }
+	  Type* vt = var->type();
+	  std::vector<const Type*> seen;
+	  Type* nt = this->substitute_type(vt, subst, var->location(), &seen);
+	  Expression* init = NULL;
+	  if (var->init() != NULL)
+	    {
+	      init = var->init()->copy();
+	      Expression::apply_generic_subst(&init, this, subst);
+	    }
+	  Variable* nv = new Variable(nt, init, false, false, false,
+				      var->location());
+	  if (var->is_used())
+	    nv->set_is_used();
+	  if (var->is_address_taken())
+	    nv->set_address_taken();
+	  if (var->is_non_escaping_address_taken())
+	    nv->set_non_escaping_address_taken();
+	  Named_object* added = to->bindings()->add_variable(no->name(), NULL,
+							     nv);
+	  subst->bind_var(no, added);
+	}
+      else if (no->is_type() || no->is_type_declaration() || no->is_const()
+	       || no->is_function() || no->is_function_declaration())
+	go_error_at(no->location(),
+		    "statement in generic function is not supported yet");
+    }
+}
+
+void
+Gogo::copy_block(Block* from, Block* to, Named_object* new_func,
+		 Generic_subst* subst)
+{
+  if (from == NULL || to == NULL)
+    return;
+  size_t mark = subst->var_count();
+  this->copy_locals(from, to, subst);
+  const std::vector<Statement*>* stmts = from->statements();
+  for (size_t i = 0; i < stmts->size(); ++i)
+    {
+      Statement* ns = this->copy_statement((*stmts)[i], to, new_func, subst);
+      if (ns != NULL)
+	to->add_statement(ns);
+    }
+  to->set_end_location(from->end_location());
+  subst->truncate_vars(mark);
+}
+
+// Copy one statement.  The statement is copied first, then
+// substitution is applied to the copy, so the template is not mutated.
+// Statements this slice does not clone become an error statement.
+
+Statement*
+Gogo::copy_statement(Statement* stmt, Block* to, Named_object* new_func,
+		     Generic_subst* subst)
+{
+  if (stmt == NULL)
+    return NULL;
+  if (stmt->classification() == Statement::STATEMENT_ERROR)
+    return Statement::make_error_statement(stmt->location());
+
+  Return_statement* ret = stmt->return_statement();
+  if (ret != NULL)
+    {
+      Expression_list* vals = NULL;
+      if (ret->vals() != NULL)
+	{
+	  vals = new Expression_list();
+	  for (Expression_list::const_iterator p = ret->vals()->begin();
+	       p != ret->vals()->end();
+	       ++p)
+	    {
+	      Expression* c = (*p)->copy();
+	      Expression::apply_generic_subst(&c, this, subst);
+	      vals->push_back(c);
+	    }
+	}
+      return Statement::make_return_statement(new_func, vals, stmt->location());
+    }
+
+  Expression_statement* es = stmt->expression_statement();
+  if (es != NULL)
+    {
+      Expression* e = es->expr()->copy();
+      Expression::apply_generic_subst(&e, this, subst);
+      return Statement::make_statement(e, es->is_ignored());
+    }
+
+  Assignment_statement* as = stmt->assignment_statement();
+  if (as != NULL)
+    {
+      Expression* lhs = as->lhs()->copy();
+      Expression::apply_generic_subst(&lhs, this, subst);
+      Expression* rhs = as->rhs()->copy();
+      Expression::apply_generic_subst(&rhs, this, subst);
+      Assignment_statement* nas =
+	Statement::make_assignment(lhs, rhs, stmt->location());
+      if (as->omit_write_barrier())
+	nas->set_omit_write_barrier();
+      return nas;
+    }
+
+  Block_statement* bs = stmt->block_statement();
+  if (bs != NULL)
+    {
+      Block* nb = new Block(to, stmt->location());
+      this->copy_block(bs->block(), nb, new_func, subst);
+      Block_statement* nbs = Statement::make_block_statement(nb,
+							    stmt->location());
+      if (bs->is_lowered_for_statement())
+	nbs->set_is_lowered_for_statement();
+      return nbs;
+    }
+
+  Variable_declaration_statement* vd = stmt->variable_declaration_statement();
+  if (vd != NULL)
+    {
+      Named_object* nv = subst->var_for(vd->var());
+      if (nv == NULL)
+	{
+	  go_error_at(stmt->location(),
+		      "statement in generic function is not supported yet");
+	  return Statement::make_error_statement(stmt->location());
+	}
+      return Statement::make_variable_declaration(nv);
+    }
+
+  go_error_at(stmt->location(),
+	      "statement in generic function is not supported yet");
+  return Statement::make_error_statement(stmt->location());
+}
+
+// Bind PARAM to ARG when PARAM is one of TPARAMS.  Otherwise walk a
+// pointer, slice, array, map, channel, or instantiation of the same
+// generic type.  Nil does not bind a type parameter.
+
+bool
+Gogo::unify_type(Type* param, Type* arg,
+		 const Typed_identifier_list* tparams,
+		 std::vector<Type*>* inferred, Location location)
+{
+  if (param == NULL || arg == NULL)
+    return true;
+  if (param->is_error_type() || arg->is_error_type())
+    return true;
+  if (arg->is_nil_type())
+    return true;
+
+  Type* p = param->forwarded();
+  Type* a = arg->forwarded();
+  if (a->is_abstract())
+    a = a->make_non_abstract_type();
+
+  Named_type* nt = p->named_type();
+  if (nt != NULL
+      && nt->real_type()->forwarded()->classification()
+	 == Type::TYPE_TYPE_PARAMETER)
+    {
+      int idx = -1;
+      for (size_t i = 0; i < tparams->size(); ++i)
+	if (tparams->at(i).type()->named_type() == nt)
+	  {
+	    idx = static_cast<int>(i);
+	    break;
+	  }
+      if (idx < 0)
+	return true;
+      if ((*inferred)[idx] == NULL)
+	(*inferred)[idx] = a;
+      else if (!this->same_type((*inferred)[idx], a))
+	{
+	  go_error_at(location, "conflicting types for type argument %qs",
+		      Gogo::message_name(tparams->at(idx).name()).c_str());
+	  return false;
+	}
+      return true;
+    }
+
+  if (p->classification() == Type::TYPE_POINTER
+      && a->classification() == Type::TYPE_POINTER)
+    return this->unify_type(p->points_to(), a->points_to(), tparams,
+			    inferred, location);
+
+  if (p->classification() == Type::TYPE_ARRAY
+      && a->classification() == Type::TYPE_ARRAY
+      && (p->array_type()->length() == NULL)
+	 == (a->array_type()->length() == NULL))
+    return this->unify_type(p->array_type()->element_type(),
+			    a->array_type()->element_type(), tparams,
+			    inferred, location);
+
+  if (p->classification() == Type::TYPE_MAP
+      && a->classification() == Type::TYPE_MAP)
+    return (this->unify_type(p->map_type()->key_type(),
+			     a->map_type()->key_type(), tparams, inferred,
+			     location)
+	    && this->unify_type(p->map_type()->val_type(),
+				a->map_type()->val_type(), tparams, inferred,
+				location));
+
+  if (p->classification() == Type::TYPE_CHANNEL
+      && a->classification() == Type::TYPE_CHANNEL
+      && p->channel_type()->element_type() != NULL
+      && a->channel_type()->element_type() != NULL)
+    return this->unify_type(p->channel_type()->element_type(),
+			    a->channel_type()->element_type(), tparams,
+			    inferred, location);
+
+  int pidx = this->type_use_index(p);
+  if (pidx >= 0)
+    {
+      int aidx = this->type_use_index(a);
+      if (aidx < 0)
+	return true;
+      Named_object* pg = this->generic_type_uses_[pidx].generic;
+      Named_object* ag = this->generic_type_uses_[aidx].generic;
+      if (pg != NULL)
+	pg = pg->resolve();
+      if (ag != NULL)
+	ag = ag->resolve();
+      if (pg != ag)
+	return true;
+      std::vector<Type*> pargs = this->generic_type_uses_[pidx].args;
+      std::vector<Type*> aargs = this->generic_type_uses_[aidx].args;
+      if (pargs.size() != aargs.size())
+	{
+	  go_error_at(location, "wrong number of type arguments");
+	  return false;
+	}
+      for (size_t i = 0; i < pargs.size(); ++i)
+	if (!this->unify_type(pargs[i], aargs[i], tparams, inferred, location))
+	  return false;
+    }
+  return true;
+}
+
+// The function type of a generic function or function declaration.
+
+static Function_type*
+generic_function_type(Named_object* fn, const Typed_identifier_list** ptparams)
+{
+  fn = fn->resolve();
+  if (fn->is_function())
+    {
+      if (ptparams != NULL)
+	*ptparams = fn->func_value()->type_parameters();
+      return fn->func_value()->type();
+    }
+  if (fn->is_function_declaration())
+    {
+      if (ptparams != NULL)
+	*ptparams = fn->func_declaration_value()->type_parameters();
+      return fn->func_declaration_value()->type();
+    }
+  if (ptparams != NULL)
+    *ptparams = NULL;
+  return NULL;
+}
+
+// Build the unlowered body of an imported generic function.  The
+// function stays a declaration so later passes do not type-check the
+// template.  Instantiation copies GENERIC_BODY.
+
+void
+Gogo::materialize_imported_generic(Named_object* no)
+{
+  Function_declaration* fd = no->func_declaration_value();
+  go_assert(fd->has_type_parameters());
+  go_assert(fd->has_imported_body());
+  if (fd->generic_body() != NULL)
+    return;
+
+  const std::string& body(fd->imported_body());
+  size_t indent = fd->is_method() ? 2 : 1;
+  size_t i = 0;
+  for (; i < indent; i++)
+    {
+      if (i >= body.length() || body.at(i) != ' ')
+	{
+	  go_error_at(fd->location(),
+		      "invalid export body for %qs: bad initial indentation",
+		      no->message_name().c_str());
+	  return;
+	}
+    }
+  if (body.size() < i + 2 || body.substr(i, 2) != "//")
+    {
+      go_error_at(fd->location(),
+		  "invalid export body for %qs: missing file comment",
+		  no->message_name().c_str());
+      return;
+    }
+  size_t colon = body.find(':', i + 2);
+  size_t nl = body.find('\n', i + 2);
+  if (nl == std::string::npos || colon == std::string::npos || nl < colon)
+    {
+      go_error_at(fd->location(),
+		  "invalid export body for %qs: missing file name",
+		  no->message_name().c_str());
+      return;
+    }
+  std::string file = body.substr(i + 2, colon - (i + 2));
+  std::string linestr = body.substr(colon + 1, nl - (colon + 1));
+  char* end;
+  long linenol = strtol(linestr.c_str(), &end, 10);
+  if (*end != '\0')
+    {
+      go_error_at(fd->location(),
+		  "invalid export body for %qs: invalid initial line number",
+		  no->message_name().c_str());
+      return;
+    }
+
+  char* alc = new char[file.length() + 1];
+  memcpy(alc, file.data(), file.length());
+  alc[file.length()] = '\0';
+  unsigned int lineno = static_cast<unsigned int>(linenol);
+  this->linemap()->start_file(alc, lineno);
+  this->linemap()->start_line(lineno, 1);
+  Location start_loc = this->linemap()->get_location(0);
+
+  Function_type* fntype = fd->type();
+  Block* outer = new Block(NULL, start_loc);
+  Function* fn = new Function(fntype, NULL, outer, start_loc);
+
+  if (fntype->is_method())
+    {
+      const Typed_identifier* receiver = fntype->receiver();
+      Variable* recv_param = new Variable(receiver->type(), NULL, false,
+					  true, true, start_loc);
+      std::string rname = receiver->name();
+      unsigned rcounter = 0;
+      Gogo::rename_if_empty(&rname, "r", &rcounter);
+      outer->bindings()->add_variable(rname, NULL, recv_param);
+    }
+
+  const Typed_identifier_list* params = fntype->parameters();
+  bool is_varargs = fntype->is_varargs();
+  unsigned pcounter = 0;
+  if (params != NULL)
+    {
+      for (Typed_identifier_list::const_iterator p = params->begin();
+	   p != params->end();
+	   ++p)
+	{
+	  Variable* param = new Variable(p->type(), NULL, false, true, false,
+					 start_loc);
+	  if (is_varargs && p + 1 == params->end())
+	    param->set_is_varargs_parameter();
+	  std::string pname = p->name();
+	  Gogo::rename_if_empty(&pname, "p", &pcounter);
+	  outer->bindings()->add_variable(pname, NULL, param);
+	}
+    }
+  fn->create_result_variables(this);
+
+  // Own the body before parsing, so a second call does not parse again.
+  fd->set_generic_body(fn);
+
+  Import_function_body ifb(this, fd->imp(), no, body, nl + 1, outer, indent);
+  Block::import_block(outer, &ifb, start_loc);
+}
+
+// Parse every imported generic before type checking.  The linemap is
+// still open here.  determine_types runs after it is stopped.
+
+void
+Gogo::materialize_imported_generics()
+{
+  for (Packages::const_iterator p = this->packages_.begin();
+       p != this->packages_.end();
+       ++p)
+    {
+      Bindings* bindings = p->second->bindings();
+      for (Bindings::const_declarations_iterator d =
+	     bindings->begin_declarations();
+	   d != bindings->end_declarations();
+	   ++d)
+	{
+	  Named_object* no = d->second;
+	  if (!no->is_function_declaration())
+	    continue;
+	  Function_declaration* fd = no->func_declaration_value();
+	  if (fd->has_type_parameters() && fd->has_imported_body()
+	      && fd->generic_body() == NULL)
+	    this->materialize_imported_generic(no);
+	}
+    }
+}
+
+// One concrete function for ARGS.  The instance is recorded before
+// its body is copied, so a recursive call finds it instead of
+// cloning again.  A declaration with no body becomes a declaration.
+
+Named_object*
+Gogo::instantiate_function(Named_object* fn, const std::vector<Type*>& args,
+			   Location location)
+{
+  if (fn == NULL)
+    return NULL;
+  fn = fn->resolve();
+
+  int existing = this->find_func_use(fn, args);
+  size_t index;
+  if (existing >= 0)
+    {
+      index = static_cast<size_t>(existing);
+      if (this->generic_func_uses_[index].instance != NULL)
+	return this->generic_func_uses_[index].instance;
+      if (this->generic_func_uses_[index].building)
+	return NULL;
+    }
+  else
+    {
+      Generic_func_use use;
+      use.generic = fn;
+      use.args = args;
+      use.instance = NULL;
+      use.building = false;
+      this->generic_func_uses_.push_back(use);
+      index = this->generic_func_uses_.size() - 1;
+    }
+
+  this->generic_func_uses_[index].building = true;
+
+  const Typed_identifier_list* tparams = NULL;
+  Function_type* ft = generic_function_type(fn, &tparams);
+  if (ft == NULL || tparams == NULL || tparams->size() != args.size())
+    {
+      go_error_at(location, "wrong number of type arguments");
+      this->generic_func_uses_[index].building = false;
+      return NULL;
+    }
+  if (!this->check_type_arguments(fn, args, location))
+    {
+      this->generic_func_uses_[index].building = false;
+      return NULL;
+    }
+
+  Generic_subst subst;
+  for (size_t i = 0; i < tparams->size(); ++i)
+    {
+      Named_type* pt = tparams->at(i).type()->named_type();
+      if (pt == NULL)
+	{
+	  go_error_at(location, "invalid type parameter");
+	  this->generic_func_uses_[index].building = false;
+	  return NULL;
+	}
+      subst.bind_type(pt, args[i]);
+    }
+
+  std::vector<const Type*> seen;
+  Type* st = this->substitute_type(ft, &subst, location, &seen);
+  Function_type* nft = st->function_type();
+  if (nft == NULL)
+    {
+      go_error_at(location, "cannot instantiate");
+      this->generic_func_uses_[index].building = false;
+      return NULL;
+    }
+
+  std::string name =
+    this->instantiation_name(Gogo::unpack_hidden_name(fn->name()));
+
+  Function* src = NULL;
+  if (fn->is_function())
+    src = fn->func_value();
+  else if (fn->is_function_declaration())
+    {
+      Function_declaration* fd = fn->func_declaration_value();
+      if (fd->generic_body() == NULL && fd->has_type_parameters()
+	  && fd->has_imported_body())
+	this->materialize_imported_generic(fn);
+      src = fd->generic_body();
+    }
+
+  Named_object* inst;
+  if (src == NULL)
+    {
+      inst = this->package_->bindings()->add_function_declaration(name, NULL,
+								  nft,
+								  location);
+      this->generic_func_uses_[index].instance = inst;
+      this->generic_func_uses_[index].building = false;
+      return inst;
+    }
+
+  Location floc = src->location();
+  Block* block = new Block(NULL, floc);
+  Function* newf = new Function(nft, NULL, block, floc);
+  inst = this->package_->bindings()->add_function(name, NULL, newf);
+  go_assert(inst->is_function() && inst->func_value() == newf);
+  // Publishing the instance before the body is copied lets a
+  // recursive instantiation of the same arguments return this
+  // function instead of cloning it again.
+  this->generic_func_uses_[index].instance = inst;
+
+  this->copy_parameters(src, block, &subst);
+  newf->create_result_variables(this);
+  this->bind_result_variables(src, block, &subst);
+  this->copy_block(src->block(), block, inst, &subst);
+
+  this->generic_func_uses_[index].building = false;
+  return inst;
+}
+
+// Infer type arguments for a call and instantiate the function.
+// Returns NULL and reports an error when a type parameter is left
+// unbound or two arguments disagree.
+
+Named_object*
+Gogo::infer_and_instantiate(Named_object* fn, Expression_list* args,
+			    Location location)
+{
+  if (fn == NULL)
+    return NULL;
+  fn = fn->resolve();
+
+  const Typed_identifier_list* tparams = NULL;
+  Function_type* ft = generic_function_type(fn, &tparams);
+  if (ft == NULL || tparams == NULL)
+    {
+      go_error_at(location, "cannot infer type arguments");
+      return NULL;
+    }
+
+  const Typed_identifier_list* parameters = ft->parameters();
+  size_t np = parameters == NULL ? 0 : parameters->size();
+  size_t na = args == NULL ? 0 : args->size();
+  if (ft->is_varargs())
+    {
+      if (np == 0 || na < np - 1)
+	{
+	  go_error_at(location, "wrong number of arguments");
+	  return NULL;
+	}
+    }
+  else if (na != np)
+    {
+      go_error_at(location, "wrong number of arguments");
+      return NULL;
+    }
+
+  for (size_t i = 0; i < na; ++i)
+    if (args->at(i)->is_error_expression())
+      return NULL;
+
+  std::vector<Type*> inferred(tparams->size(), static_cast<Type*>(NULL));
+  size_t nfixed = ft->is_varargs() ? np - 1 : np;
+  for (size_t i = 0; i < nfixed; ++i)
+    {
+      Type* at = args->at(i)->type();
+      if (at->is_error_type())
+	return NULL;
+      if (!this->unify_type(parameters->at(i).type(), at, tparams, &inferred,
+			    location))
+	return NULL;
+    }
+
+  if (ft->is_varargs() && na >= np && np > 0)
+    {
+      Type* slice = parameters->at(np - 1).type()->forwarded();
+      Type* elem = parameters->at(np - 1).type();
+      if (slice->classification() == Type::TYPE_ARRAY
+	  && slice->array_type()->length() == NULL)
+	elem = slice->array_type()->element_type();
+      for (size_t i = np - 1; i < na; ++i)
+	{
+	  Type* at = args->at(i)->type();
+	  if (at->is_error_type())
+	    return NULL;
+	  if (!this->unify_type(elem, at, tparams, &inferred, location))
+	    return NULL;
+	}
+    }
+
+  for (size_t i = 0; i < inferred.size(); ++i)
+    if (inferred[i] == NULL)
+      {
+	go_error_at(location, "cannot infer type argument %qs",
+		    Gogo::message_name(tparams->at(i).name()).c_str());
+	return NULL;
+      }
+  return this->instantiate_function(fn, inferred, location);
+}
+
+// Define type instances whose arguments are concrete, then replace
+// explicit function instantiations.  Cloning a function can record
+// further type instances, so the type fixpoint runs again.  Templates
+// stay in the definition list; the caller hides them afterwards.
+
+void
+Gogo::instantiate_generics()
+{
+  this->materialize_imported_generics();
+  this->define_ready_type_instances();
+  Expression::resolve_instantiations(this);
+  this->define_ready_type_instances();
 }
 
 // Convert all names types in a set of bindings.
@@ -5970,11 +7611,12 @@ void
 Function::export_func(Export* exp, const Named_object* no) const
 {
   Block* block = NULL;
-  if (this->export_for_inlining())
+  if (this->export_for_inlining() || this->has_type_parameters())
     block = this->block_;
   Function::export_func_with_type(exp, no, this->type_, this->results_,
 				  this->is_method() && this->nointerface(),
-				  this->asm_name(), block, this->location_);
+				  this->asm_name(), this->type_parameters_,
+				  block, this->location_);
 }
 
 // Export a function with a type.
@@ -5984,6 +7626,7 @@ Function::export_func_with_type(Export* exp, const Named_object* no,
 				const Function_type* fntype,
 				Function::Results* result_vars,
 				bool nointerface, const std::string& asm_name,
+				const Typed_identifier_list* type_parameters,
 				Block* block, Location loc)
 {
   exp->write_c_string("func ");
@@ -6027,6 +7670,9 @@ Function::export_func_with_type(Export* exp, const Named_object* no,
       exp->write_c_string(".");
       exp->write_string(Gogo::unpack_hidden_name(name));
     }
+
+  if (type_parameters != NULL)
+    exp->write_type_parameters(type_parameters);
 
   exp->write_c_string(" (");
   const Typed_identifier_list* parameters = fntype->parameters();
@@ -6141,11 +7787,13 @@ Function::import_func(Import* imp, std::string* pname,
 		      bool* is_varargs,
 		      bool* nointerface,
 		      std::string* asm_name,
-		      std::string* body)
+		      std::string* body,
+		      Typed_identifier_list** type_parameters)
 {
   imp->require_c_string("func ");
 
   *nointerface = false;
+  *type_parameters = NULL;
   while (imp->match_c_string("/*"))
     {
       imp->advance(2);
@@ -6195,6 +7843,10 @@ Function::import_func(Import* imp, std::string* pname,
 		  imp->pos());
       return false;
     }
+
+  *type_parameters = NULL;
+  if (imp->peek_char() == '[')
+    *type_parameters = imp->read_type_parameters();
 
   Typed_identifier_list* parameters;
   *is_varargs = false;

@@ -188,6 +188,9 @@ Type::is_basic_type() const
     case TYPE_FORWARD:
       return this->base()->is_basic_type();
 
+    case TYPE_TYPE_PARAMETER:
+      return false;
+
     default:
       go_unreachable();
     }
@@ -4047,6 +4050,11 @@ Type::import_type(Import* imp)
     return Channel_type::do_import(imp);
   else if (imp->match_c_string("interface"))
     return Interface_type::do_import(imp);
+  else if (imp->match_c_string("typeparam"))
+    {
+      imp->require_c_string("typeparam");
+      return Type::make_type_parameter("", NULL, imp->location());
+    }
   else
     {
       go_error_at(imp->location(), "import error: expected type");
@@ -4130,9 +4138,11 @@ Type_parameter::do_type_descriptor(Gogo*, Named_type*)
 }
 
 void
-Type_parameter::do_export(Export*) const
+Type_parameter::do_export(Export* exp) const
 {
-  this->report_misuse("cannot export type parameter %qs");
+  // The name and the constraint are written with the generic type or
+  // function.  This is only the underlying type.
+  exp->write_c_string("typeparam");
 }
 
 Type*

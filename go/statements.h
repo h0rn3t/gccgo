@@ -870,6 +870,11 @@ class Expression_statement : public Statement
   expr()
   { return this->expr_; }
 
+  // True when the value of the expression is explicitly ignored.
+  bool
+  is_ignored() const
+  { return this->is_ignored_; }
+
  protected:
   int
   do_traverse(Traverse* traverse)

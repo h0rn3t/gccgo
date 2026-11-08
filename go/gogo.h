@@ -254,6 +254,76 @@ priority_compare(const Import_init* i1, const Import_init* i2)
   return i1->init_name() < i2->init_name();
 }
 
+// Maps type parameters to type arguments, and variables of a generic
+// function onto the variables of one instantiation.  Vectors stay in
+// binding order so an inner block can shadow a name and then pop it.
+class Generic_subst
+{
+ public:
+  void
+  bind_type(Named_type* param, Type* arg)
+  { this->types_.push_back(Type_bind(param, arg)); }
+
+  Type*
+  type_for(const Named_type* param) const
+  {
+    for (std::vector<Type_bind>::const_iterator p = this->types_.begin();
+	 p != this->types_.end();
+	 ++p)
+      if (p->param == param)
+	return p->arg;
+    return NULL;
+  }
+
+  void
+  bind_var(Named_object* from, Named_object* to)
+  { this->vars_.push_back(Var_bind(from, to)); }
+
+  Named_object*
+  var_for(const Named_object* from) const
+  {
+    for (std::vector<Var_bind>::const_reverse_iterator p = this->vars_.rbegin();
+	 p != this->vars_.rend();
+	 ++p)
+      if (p->from == from)
+	return p->to;
+    return NULL;
+  }
+
+  size_t
+  var_count() const
+  { return this->vars_.size(); }
+
+  void
+  truncate_vars(size_t n)
+  {
+    go_assert(n <= this->vars_.size());
+    this->vars_.resize(n);
+  }
+
+ private:
+  struct Type_bind
+  {
+    Named_type* param;
+    Type* arg;
+    Type_bind(Named_type* p, Type* a)
+      : param(p), arg(a)
+    { }
+  };
+
+  struct Var_bind
+  {
+    Named_object* from;
+    Named_object* to;
+    Var_bind(Named_object* f, Named_object* t)
+      : from(f), to(t)
+    { }
+  };
+
+  std::vector<Type_bind> types_;
+  std::vector<Var_bind> vars_;
+};
+
 // The holder for the internal representation of the entire
 // compilation unit.
 
@@ -522,12 +592,49 @@ class Gogo
   { return this->type_parameter_bindings_; }
 
   // Drop generic functions and generic named types from the
-  // definition list after type checking.  They stay in the lookup
-  // map.  Later passes must not lower or emit an uninstantiated
-  // generic; a use still reports an error if it asks for a backend
-  // type.
+  // definition list.  They stay in the lookup map.  Call this after
+  // instantiating the uses in this package and before type checking,
+  // so a template body is not type-checked in place.
   void
   hide_uninstantiated_generics();
+
+  // Create concrete instances for generic types and functions used
+  // with type arguments that do not themselves contain type
+  // parameters.  Templates are left in place for a later
+  // instantiation.
+  void
+  instantiate_generics();
+
+  // Parse-time placeholder for BASE[ARGS].  BASE is a generic named
+  // type, a type declaration that already has type parameters, or an
+  // unknown name that may still become one.  The result is a forward
+  // declaration.  Defining that declaration later makes every
+  // existing pointer to it see the instance.
+  Type*
+  make_instantiation_type(Type* base, const std::vector<Type*>& args,
+			  Location);
+
+  // Substitute type parameters.  A type that does not use one is
+  // returned unchanged.
+  Type*
+  substitute_type(Type*, Generic_subst*, Location);
+
+  // True when T still mentions a type parameter, or a placeholder
+  // whose arguments do.
+  bool
+  type_depends_on_type_parameter(Type* t) const;
+
+  // Infer type arguments for a call to FN and return the instance.
+  // Reports an error and returns NULL when inference fails.
+  Named_object*
+  infer_and_instantiate(Named_object* fn, Expression_list* args,
+			Location);
+
+  // Concrete function for one argument list.  FN is a generic
+  // function or function declaration.
+  Named_object*
+  instantiate_function(Named_object* fn, const std::vector<Type*>& args,
+		       Location);
 
   // Look up a name in the current block.
   Named_object*
@@ -1391,6 +1498,123 @@ class Gogo
   // A list of functions that we want to inline.  These will be sent
   // to the backend.
   std::vector<Named_object*> imported_inline_functions_;
+
+  // One use of a generic type.  OBJECT is a type declaration until
+  // the instance is defined; after that it is the named instance.
+  // TYPE is the forward declaration handed back to the parser.
+  struct Generic_type_use
+  {
+    Named_object* object;
+    Named_object* generic;
+    std::vector<Type*> args;
+    Type* type;
+    Location location;
+    bool building;
+    bool defined;
+
+    Generic_type_use()
+      : object(NULL), generic(NULL), args(), type(NULL),
+	location(Linemap::unknown_location()),
+	building(false), defined(false)
+    { }
+  };
+
+  // One use of a generic function.
+  struct Generic_func_use
+  {
+    Named_object* generic;
+    std::vector<Type*> args;
+    Named_object* instance;
+    bool building;
+
+    Generic_func_use()
+      : generic(NULL), args(), instance(NULL), building(false)
+    { }
+  };
+
+  bool
+  same_type(Type*, Type*) const;
+
+  bool
+  same_arg_list(const std::vector<Type*>&, const std::vector<Type*>&) const;
+
+  Named_object*
+  generic_type_object(Type*) const;
+
+  const Typed_identifier_list*
+  generic_type_params(Named_object*) const;
+
+  int
+  find_type_use(Named_object* generic, const std::vector<Type*>& args) const;
+
+  int
+  type_use_index(Type*) const;
+
+  int
+  find_func_use(Named_object* generic, const std::vector<Type*>& args) const;
+
+  bool
+  depends_on_type_parameter(Type*, std::vector<const Type*>*) const;
+
+  Type*
+  substitute_type(Type*, Generic_subst*, Location, std::vector<const Type*>*);
+
+  void
+  materialize_imported_generics();
+
+  void
+  materialize_imported_generic(Named_object*);
+
+  void
+  define_ready_type_instances();
+
+  Type*
+  define_type_instance(size_t index);
+
+  // Copy methods from a generic type onto one concrete instance.
+  void
+  copy_generic_methods(Named_object* generic, Named_type* instance,
+		       const std::vector<Type*>& args, Location);
+
+  bool
+  check_type_arguments(Named_object* generic, const std::vector<Type*>& args,
+		       Location);
+
+  bool
+  constraint_satisfied(Type* constraint, Type* arg, Location);
+
+  std::string
+  instantiation_name(const std::string& base_name);
+
+  void
+  copy_parameters(Function* from, Block* to, Generic_subst*);
+
+  void
+  bind_result_variables(Function* from, Block* to, Generic_subst*);
+
+  void
+  copy_locals(Block* from, Block* to, Generic_subst*);
+
+  void
+  copy_block(Block* from, Block* to, Named_object* new_func, Generic_subst*);
+
+  Statement*
+  copy_statement(Statement*, Block* to, Named_object* new_func,
+		 Generic_subst*);
+
+  bool
+  unify_type(Type* param, Type* arg, const Typed_identifier_list* tparams,
+	     std::vector<Type*>* inferred, Location);
+
+  // Instantiations of generic types.
+  std::vector<Generic_type_use> generic_type_uses_;
+  // Instantiations of generic functions.
+  std::vector<Generic_func_use> generic_func_uses_;
+  // Disambiguates instantiated names.
+  unsigned int instantiation_count_;
+  // Generic functions and types removed from the definition list so
+  // they are not type-checked, but still exported.
+  std::vector<Named_object*> generics_to_export_;
 };
 
 // A block of statements.
@@ -1857,15 +2081,19 @@ class Function
   static void
   export_func_with_type(Export*, const Named_object*,
 			const Function_type*, Results*, bool nointerface,
-			const std::string& asm_name, Block* block, Location);
+			const std::string& asm_name,
+			const Typed_identifier_list* type_parameters,
+			Block* block, Location);
 
   // Import a function.  Reports whether the import succeeded.
+  // *TYPE_PARAMETERS is set when the function is generic.
   static bool
   import_func(Import*, std::string* pname, Package** pkg,
 	      bool* is_exported, Typed_identifier** receiver,
 	      Typed_identifier_list** pparameters,
 	      Typed_identifier_list** presults, bool* is_varargs,
-	      bool* nointerface, std::string* asm_name, std::string* body);
+	      bool* nointerface, std::string* asm_name, std::string* body,
+	      Typed_identifier_list** type_parameters);
 
  private:
   // Type for mapping from label names to Label objects.
@@ -1994,7 +2222,7 @@ class Function_declaration
   Function_declaration(Function_type* fntype, Location location)
     : fntype_(fntype), type_parameters_(NULL), location_(location),
       asm_name_(), descriptor_(NULL), fndecl_(NULL), pragmas_(0),
-      imported_body_(), is_on_inlinable_list_(false)
+      imported_body_(), is_on_inlinable_list_(false), generic_body_(NULL)
   { }
 
   Function_type*
@@ -2012,6 +2240,17 @@ class Function_declaration
   bool
   has_type_parameters() const
   { return this->type_parameters_ != NULL; }
+
+  // The unlowered body of an imported generic, or NULL.  This is not
+  // installed as a package function: type checking a template in place
+  // would fix its types.  Instantiation copies this body.
+  Function*
+  generic_body() const
+  { return this->generic_body_; }
+
+  void
+  set_generic_body(Function* body)
+  { this->generic_body_ = body; }
 
   Location
   location() const
@@ -2065,6 +2304,14 @@ class Function_declaration
     this->imported_body_ = imported_body;
   }
 
+  const std::string&
+  imported_body() const
+  { return this->imported_body_; }
+
+  Import*
+  imp() const
+  { return this->imp_; }
+
   // Whether this declaration is on the list of inlinable functions.
   bool
   is_on_inlinable_list() const
@@ -2114,7 +2361,8 @@ class Function_declaration
   {
     Function::export_func_with_type(exp, no, this->fntype_, NULL,
 				    this->is_method() && this->nointerface(),
-				    this->asm_name_, NULL, this->location_);
+				    this->asm_name_, this->type_parameters_,
+				    NULL, this->location_);
   }
 
   // Check that the types used in this declaration's signature are defined.
@@ -2143,6 +2391,8 @@ class Function_declaration
   std::string imported_body_;
   // Whether this declaration is already on the list of inlinable functions.
   bool is_on_inlinable_list_;
+  // Unlowered body of an imported generic function.  Not traversed.
+  Function* generic_body_;
 };
 
 // A variable.
@@ -2731,8 +2981,19 @@ class Type_declaration
  public:
   Type_declaration(Location location)
     : location_(location), in_function_(NULL), in_function_index_(0),
-      methods_(), issued_warning_(false)
+      methods_(), type_parameters_(NULL), issued_warning_(false)
   { }
+
+  // Type parameters already parsed for this declaration.  Set before
+  // the type body is parsed, so a use of the name inside the body can
+  // be instantiated.  NULL when this is not a generic type.
+  void
+  set_type_parameters(Typed_identifier_list* type_parameters)
+  { this->type_parameters_ = type_parameters; }
+
+  const Typed_identifier_list*
+  type_parameters() const
+  { return this->type_parameters_; }
 
   // Return the location.
   Location
@@ -2799,6 +3060,8 @@ class Type_declaration
   unsigned int in_function_index_;
   // Methods defined before the type is defined.
   std::vector<Named_object*> methods_;
+  // Type parameters of a generic type, or NULL.
+  Typed_identifier_list* type_parameters_;
   // True if we have issued a warning about a use of this type
   // declaration when it is undefined.
   bool issued_warning_;

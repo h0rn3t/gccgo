@@ -179,6 +179,21 @@ class Parse
   // Current token is '['.  True when this bracket starts a type
   // parameter list rather than an array length.  Tokens are put back.
   bool bracket_introduces_type_parameters();
+  // Current token is '['.  True when this bracket starts a type
+  // argument list rather than an index or slice.  Tokens are put back.
+  bool bracket_introduces_type_arguments(Expression*);
+  // Current token is '['.  Parse a type argument list, including the
+  // brackets.
+  std::vector<Type*> type_arguments();
+  // Current token is '['.  Parse type arguments applied to BASE.
+  Type* instantiated_type(Type* base);
+  // Receiver form Box[T]: the names are type parameters, not types.
+  // Returns NULL when BASE is not a generic type, having read nothing.
+  Type* receiver_instantiation(Type* base);
+  // Current token is '['.  Parse type arguments applied to EXPR.
+  Expression* instantiation_expr(Expression* expr);
+  // True when TOKEN is a type, or the start of a type literal.
+  bool token_starts_type_argument(const Token*);
   bool parameters(Typed_identifier_list**, bool* is_varargs);
   Typed_identifier_list* parameter_list(bool* is_varargs);
   void parameter_decl(bool, Typed_identifier_list*, bool*, bool*, bool*);
@@ -326,6 +341,10 @@ class Parse
   Token replay_token_;
   // Whether the function we are parsing had errors in the signature.
   bool is_erroneous_function_;
+  // True while the receiver of a method is parsed.
+  bool parsing_receiver_;
+  // Type parameters declared by the receiver, or NULL.
+  Typed_identifier_list* receiver_type_parameters_;
   // The code we are generating.
   Gogo* gogo_;
   // A stack of statements for which break may be used.

@@ -131,10 +131,24 @@ Statement::import_statement(Import_function_body* ifb, Location loc)
     }
   else if (ifb->match_c_string("return"))
     {
-      // After lowering return statements have no expressions.  The
-      // return expressions are assigned to result parameters.
+      // After lowering, return statements have no expressions: the
+      // values were assigned to the result parameters, and the next
+      // bytes are " //".  A generic body is exported before that
+      // lowering, so the expressions are still here.
       ifb->advance(6);
-      return Statement::make_return_statement(ifb->function(), NULL, loc);
+      Expression_list* vals = NULL;
+      if (!ifb->match_c_string(" //") && ifb->match_c_string(" "))
+	{
+	  vals = new Expression_list();
+	  while (!ifb->match_c_string(" //"))
+	    {
+	      ifb->require_c_string(" ");
+	      vals->push_back(Expression::import_expression(ifb, loc));
+	      if (ifb->saw_error())
+		break;
+	    }
+	}
+      return Statement::make_return_statement(ifb->function(), vals, loc);
     }
   else if (ifb->match_c_string("var $t"))
     return Temporary_statement::do_import(ifb, loc);
@@ -3604,6 +3618,18 @@ void
 Return_statement::do_export_statement(Export_function_body* efb)
 {
   efb->write_c_string("return");
+  // Lowered returns have no values.  A generic body still does.
+  const Expression_list* vals = this->vals();
+  if (vals == NULL)
+    return;
+  for (Expression_list::const_iterator p = vals->begin();
+       p != vals->end();
+       ++p)
+    {
+      efb->write_c_string(" ");
+      if (*p != NULL)
+	(*p)->export_expression(efb);
+    }
 }
 
 // Dump the AST representation for a return statement.

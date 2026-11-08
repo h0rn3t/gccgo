@@ -335,6 +335,15 @@ Collect_export_references::prepare_types(const std::vector<Named_object*>& sorte
 	case Named_object::NAMED_OBJECT_TYPE:
 	  Type::traverse(no->type_value()->real_type(), this);
 	  this->traverse_named_type(no->type_value());
+	  if (no->type_value()->has_type_parameters())
+	    {
+	      const Typed_identifier_list* tparams =
+		no->type_value()->type_parameters();
+	      for (Typed_identifier_list::const_iterator pt = tparams->begin();
+		   pt != tparams->end();
+		   ++pt)
+		Type::traverse(pt->type(), this);
+	    }
 	  break;
 
 	case Named_object::NAMED_OBJECT_VAR:
@@ -345,7 +354,16 @@ Collect_export_references::prepare_types(const std::vector<Named_object*>& sorte
 	  {
 	    Function* fn = no->func_value();
 	    this->traverse_function_type(fn->type());
-	    if (fn->export_for_inlining())
+	    if (fn->has_type_parameters())
+	      {
+		const Typed_identifier_list* tparams = fn->type_parameters();
+		for (Typed_identifier_list::const_iterator pt =
+		       tparams->begin();
+		     pt != tparams->end();
+		     ++pt)
+		  Type::traverse(pt->type(), this);
+	      }
+	    if (fn->export_for_inlining() || fn->has_type_parameters())
 	      fn->block()->traverse(this);
 	  }
 	  break;
@@ -445,7 +463,15 @@ Collect_export_references::traverse_named_type(Named_type* nt)
 	{
 	  Function* fn = (*pm)->func_value();
 	  this->traverse_function_type(fn->type());
-	  if (fn->export_for_inlining())
+	  if (fn->has_type_parameters())
+	    {
+	      const Typed_identifier_list* tparams = fn->type_parameters();
+	      for (Typed_identifier_list::const_iterator pt = tparams->begin();
+		   pt != tparams->end();
+		   ++pt)
+		Type::traverse(pt->type(), this);
+	    }
+	  if (fn->export_for_inlining() || fn->has_type_parameters())
 	    fn->block()->traverse(this);
 	}
 
@@ -847,7 +873,8 @@ Export::export_globals(const std::string& package_name,
 		       const std::string& import_init_fn,
                        const Import_init_set& imported_init_fns,
 		       const Bindings* bindings,
-                       Unordered_set(Named_object*)* functions_marked_inline)
+                       Unordered_set(Named_object*)* functions_marked_inline,
+		       const std::vector<Named_object*>* generics)
 {
   // If there have been any errors so far, don't try to export
   // anything.  That way the export code doesn't have to worry about
@@ -888,6 +915,16 @@ Export::export_globals(const std::string& package_name,
       if (p->second->is_function_declaration()
 	  && should_export(p->second))
 	exports.insert(p->second);
+    }
+
+  // Generic templates were removed from the definition list so they
+  // are not type-checked in place.  Export the ones that are visible.
+  if (generics != NULL)
+    {
+      for (std::vector<Named_object*>::const_iterator p = generics->begin();
+	   p != generics->end();
+	   ++p)
+	exports.insert(*p);
     }
 
   // Track all imported packages mentioned in export data.
@@ -1505,7 +1542,18 @@ Export::write_type_definition(const Type* type, int index)
 	  this->write_string(package->pkgpath());
 	  this->write_c_string(".");
 	}
-      this->write_string(nt->named_object()->name());
+      // Two generics in one package both have a parameter named T.
+      // The packed names match.  The index keeps the export names apart;
+      // '#' is not a dot, so the importer's pkgpath split stays intact.
+      std::string tname = no->name();
+      Type* under = nt->real_type()->forwarded();
+      if (under->classification() == Type::TYPE_TYPE_PARAMETER)
+	{
+	  char nbuf[32];
+	  snprintf(nbuf, sizeof nbuf, "#%d", index);
+	  tname.append(nbuf);
+	}
+      this->write_string(tname);
       this->write_c_string("\" ");
 
       if (!nt->in_heap())
@@ -1513,6 +1561,12 @@ Export::write_type_definition(const Type* type, int index)
 
       if (nt->is_alias())
 	this->write_c_string("= ");
+
+      if (nt->has_type_parameters())
+	{
+	  this->write_type_parameters(nt->type_parameters());
+	  this->write_c_string(" ");
+	}
     }
 
   type->export_type(this);
@@ -1608,6 +1662,38 @@ Export::write_type(const Type* type)
   char buf[30];
   snprintf(buf, sizeof buf, "<type %d>", index);
   this->write_c_string(buf);
+}
+
+// Write [P C, ...].  P is the type parameter, C is its constraint.
+
+void
+Export::write_type_parameters(const Typed_identifier_list* type_parameters)
+{
+  if (type_parameters == NULL)
+    return;
+  this->write_c_string("[");
+  bool first = true;
+  for (Typed_identifier_list::const_iterator p = type_parameters->begin();
+       p != type_parameters->end();
+       ++p)
+    {
+      if (first)
+	first = false;
+      else
+	this->write_c_string(", ");
+      this->write_type(p->type());
+      this->write_c_string(" ");
+      Type_parameter* raw = p->type()->type_parameter();
+      if (raw == NULL || raw->constraint() == NULL)
+	{
+	  go_error_at(p->location(), "invalid type parameter %qs",
+		      Gogo::message_name(p->name()).c_str());
+	  this->write_type(Type::make_error_type());
+	}
+      else
+	this->write_type(raw->constraint());
+    }
+  this->write_c_string("]");
 }
 
 // Export a type to a function body.

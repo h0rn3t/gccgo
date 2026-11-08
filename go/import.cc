@@ -928,9 +928,10 @@ Import::import_func(Package* package)
   bool nointerface;
   std::string asm_name;
   std::string body;
+  Typed_identifier_list* type_parameters = NULL;
   if (!Function::import_func(this, &name, &fpkg, &is_exported, &receiver,
 			     &parameters, &results, &is_varargs, &nointerface,
-			     &asm_name, &body))
+			     &asm_name, &body, &type_parameters))
     return;
   if (fpkg == NULL)
     fpkg = package;
@@ -980,6 +981,8 @@ Import::import_func(Package* package)
     no->func_declaration_value()->set_nointerface();
   if (!asm_name.empty())
     no->func_declaration_value()->set_asm_name(asm_name);
+  if (type_parameters != NULL)
+    no->func_declaration_value()->set_type_parameters(type_parameters);
   if (!body.empty() && !no->func_declaration_value()->has_imported_body())
     no->func_declaration_value()->set_imported_body(this, body);
 }
@@ -1136,6 +1139,58 @@ Import::read_type()
   return type;
 }
 
+// Read [P C, ...].  P is the named type parameter, C its constraint.
+
+Typed_identifier_list*
+Import::read_type_parameters()
+{
+  this->require_c_string("[");
+  Typed_identifier_list* ret = new Typed_identifier_list();
+  if (this->peek_char() == ']')
+    {
+      go_error_at(this->location_,
+		  "error in import data at %d: empty type parameter list",
+		  this->pos());
+      this->require_c_string("]");
+      delete ret;
+      return NULL;
+    }
+
+  while (true)
+    {
+      Type* param = this->read_type();
+      this->require_c_string(" ");
+      Type* constraint = this->read_type();
+      Type_parameter* raw = param->type_parameter();
+      if (raw == NULL)
+	{
+	  go_error_at(this->location_,
+		      "error in import data at %d: invalid type parameter",
+		      this->pos());
+	  this->stream_->set_saw_error();
+	}
+      else
+	{
+	  raw->set_constraint(constraint);
+	  Named_type* nt = param->named_type();
+	  std::string name;
+	  if (nt != NULL)
+	    name = nt->named_object()->name();
+	  ret->push_back(Typed_identifier(name, param, this->location_));
+	}
+      if (this->peek_char() != ',')
+	break;
+      this->require_c_string(", ");
+    }
+  this->require_c_string("]");
+  if (ret->empty())
+    {
+      delete ret;
+      return NULL;
+    }
+  return ret;
+}
+
 // Read a named type from the import stream and store it in
 // this->types_[index].  The stream should be positioned immediately
 // after the '"' that starts the name.
@@ -1191,6 +1246,13 @@ Import::read_named_type(int index)
     {
       stream->advance(2);
       is_alias = true;
+    }
+
+  Typed_identifier_list* type_parameters = NULL;
+  if (stream->peek_char() == '[')
+    {
+      type_parameters = this->read_type_parameters();
+      this->require_c_string(" ");
     }
 
   // Declare the type in the appropriate package.  If we haven't seen
@@ -1265,6 +1327,8 @@ Import::read_named_type(int index)
 	    ntype->set_not_in_heap();
 	  if (is_alias)
 	    ntype->set_is_alias();
+	  if (type_parameters != NULL)
+	    ntype->set_type_parameters(type_parameters);
 
 	  if (!type->is_undefined() && type->interface_type() != NULL)
 	    this->gogo_->record_interface_type(type->interface_type());

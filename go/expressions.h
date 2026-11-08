@@ -14,6 +14,7 @@
 #include "runtime.h"
 
 class Gogo;
+class Generic_subst;
 class Translate_context;
 class Traverse;
 class Statement_inserter;
@@ -145,6 +146,9 @@ class Expression
     EXPRESSION_LABEL_ADDR,
     EXPRESSION_CONDITIONAL,
     EXPRESSION_COMPOUND,
+    // A generic function applied to type arguments.  Lowered to a
+    // reference to the instantiated function.
+    EXPRESSION_INSTANTIATION,
     EXPRESSION_BACKEND
   };
 
@@ -161,6 +165,11 @@ class Expression
   // parsing.
   static Expression*
   make_type(Type*, Location);
+
+  // A generic function (or an unknown name) applied to type arguments.
+  static Expression*
+  make_instantiation(Expression* operand, const std::vector<Type*>& args,
+		     Location);
 
   // Make a unary expression.
   static Expression*
@@ -710,6 +719,14 @@ class Expression
   conversion_expression()
   { return this->convert<Type_conversion_expression, EXPRESSION_CONVERSION>(); }
 
+  // If this is a composite literal, return it.  Otherwise return NULL.
+  Composite_literal_expression*
+  composite_literal_expression()
+  {
+    return this->convert<Composite_literal_expression,
+			 EXPRESSION_COMPOSITE_LITERAL>();
+  }
+
   // If this is an unsafe conversion expression, return the
   // Unsafe_type_conversion_expression structure.  Otherwise, return NULL.
   Unsafe_type_conversion_expression*
@@ -1024,6 +1041,16 @@ class Expression
   // Determine the type when there is no context.
   void
   determine_type_no_context(Gogo*);
+
+  // Replace type parameters and cloned variables in this expression.
+  // Instantiations whose arguments are concrete are replaced by the
+  // instantiated function or type.
+  static void
+  apply_generic_subst(Expression**, Gogo*, Generic_subst*);
+
+  // Replace concrete instantiation expressions in the package.
+  static void
+  resolve_instantiations(Gogo*);
 
   // Return the type of the expression.  This should not be called
   // before the determine_types pass.
@@ -1928,6 +1955,13 @@ class Type_conversion_expression : public Expression
   Expression*
   expr() const
   { return this->expr_; }
+
+  // Replace the destination type.  Used when instantiating a generic
+  // function: the node is a copy, and the type still names a type
+  // parameter.
+  void
+  set_type(Type* type)
+  { this->type_ = type; }
 
   // Permit converting from one function type to another.  This is
   // used internally for method expressions.
@@ -3940,6 +3974,16 @@ class Composite_literal_expression : public Parser_expression
       all_are_names_(all_are_names), key_path_(std::vector<bool>(depth)),
       traverse_order_(NULL)
   {}
+
+  // The type of the literal, as parsed.  May be a generic placeholder.
+  Type*
+  type() const
+  { return this->type_; }
+
+  // Replace the literal's type when instantiating a generic function.
+  void
+  set_type(Type* type)
+  { this->type_ = type; }
 
 
   // Mark the DEPTH entry of KEY_PATH as containing a key.

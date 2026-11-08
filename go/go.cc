@@ -118,6 +118,12 @@ go_parse_input_files(const char** filenames, unsigned int filename_count,
     ::gogo->add_linkname(p->first, p->second.is_exported, p->second.ext_name,
 			 p->second.loc);
 
+  // Instantiate generic types and functions whose type arguments are
+  // already concrete, then drop the templates.  Type checking a
+  // template in place would fix its types and block another instance.
+  ::gogo->instantiate_generics();
+  ::gogo->hide_uninstantiated_generics();
+
   // Lower calls to builtin functions.
   ::gogo->lower_builtin_calls();
 
@@ -140,11 +146,6 @@ go_parse_input_files(const char** filenames, unsigned int filename_count,
 
   // Check types and issue errors as appropriate.
   ::gogo->check_types();
-
-  // Generic declarations have been type-checked.  Drop them from the
-  // definition list so later passes do not lower or emit a function
-  // or type that still contains type parameters.
-  ::gogo->hide_uninstantiated_generics();
 
   // Now that we have seen all the names and we know all the types,
   // lower the parse tree into a form which is easier to use.
